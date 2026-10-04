@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.egg-info/
+# saved documents, notes and settings (default location is ~/.paper_index, outside the repo;
+# these cover PAPER_INDEX_HOME pointed inside the project)
+.paper_index/
+data/
+docs/
+settings.json

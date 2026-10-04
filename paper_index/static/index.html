@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paper Index</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231d1d1b'/%3E%3Crect x='8' y='15' width='16' height='4' fill='%23ffd628'/%3E%3C/svg%3E">
+<style>
+:root { --bg: #fafaf8; --panel: #f4f3ef; --surface: #fff; --text: #1d1d1b; --muted: #8a8983; --line: #e8e6e0; --accent: #2f5bd3; --danger: #b3261e;
+  --mark: rgba(255,210,0,.42); --shadow: 0 10px 30px rgba(0,0,0,.12), 0 1px 3px rgba(0,0,0,.06); --serif: "Iowan Old Style", Charter, Georgia, serif; }
+@media (prefers-color-scheme: dark) { :root { --bg: #171716; --panel: #1d1d1b; --surface: #252523; --text: #ecebe6; --muted: #8f8d86;
+  --line: #2f2e2b; --accent: #7aa0ff; --danger: #ff8a80; --shadow: 0 10px 30px rgba(0,0,0,.5); } }
+/* base */
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+button, input, textarea { font: inherit; color: inherit; outline: none; }
+button { cursor: pointer; background: none; border: 0; padding: 0; }
+a { color: inherit; text-decoration: none; }
+ul { list-style: none; margin: 0; padding: 0; }
+textarea, input[type=text], .pop input { width: 100%; padding: 8px 10px; border: 0; border-radius: 8px; background: var(--panel); resize: vertical; display: block; }
+.ghost { height: 30px; padding: 0 10px; border-radius: 7px; color: var(--muted); white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; }
+.ghost:hover, .ghost.on, #list a:hover, #list a.on, #list a.kbd, .ann:hover, .toc:hover, .menu > :hover { background: var(--panel); color: var(--text); }
+.ghost svg { width: 17px; height: 17px; }
+.row { display: flex; align-items: center; gap: 4px; }
+.hint, .label, .meta, .m, .s, .toc, .empty, .loading { color: var(--muted); font-size: 12px; }
+.label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; padding: 10px 18px 4px; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+.popup, .pop, dialog { background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
+/* layout: header, library, reader, side panel */
+header { height: 52px; display: flex; align-items: center; gap: 10px; padding: 0 12px 0 18px; }
+header > a { font-weight: 600; width: 250px; flex: none; }
+#omni { flex: 1; max-width: 640px; height: 36px; padding: 0 14px; border-radius: 18px; border: 1px solid transparent; background: var(--panel); }
+#omni:focus { background: var(--surface); border-color: var(--line); box-shadow: var(--shadow); }
+main { display: grid; grid-template-columns: 268px minmax(0, 1fr) 330px; height: calc(100vh - 52px); }
+#left, #right { overflow: auto; } #right { padding: 4px 16px 40px; } #list { padding: 4px 8px 24px; }
+#list a { display: block; padding: 8px 10px; border-radius: 8px; }
+.s { margin-top: 2px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.s b { color: var(--text); background: var(--mark); font-weight: 500; }
+#reader { display: flex; flex-direction: column; min-height: 0; background: var(--surface); border: 1px solid var(--line); border-bottom: 0; border-radius: 12px 12px 0 0; overflow: hidden; }
+.bar { padding: 6px 8px 6px 16px; border-bottom: 1px solid var(--line); position: relative; }
+.bar h1 { font-size: 14px; margin: 0 8px 0 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.popup { position: absolute; right: 8px; top: 42px; z-index: 40; padding: 4px; min-width: 190px; }
+.popup > * { display: block; width: 100%; text-align: left; padding: 7px 10px; border-radius: 6px; }
+iframe { flex: 1; width: 100%; border: 0; background: #fff; }
+.empty, .loading { margin: 22vh auto 0; text-align: center; font-size: 14px; }
+.empty h2 { font-size: 22px; color: var(--text); margin: 0 0 6px; }
+kbd { font: 12px ui-monospace, monospace; padding: 1px 6px; border: 1px solid var(--line); border-radius: 4px; }
+#notes { min-height: 96px; } #notes:focus { background: var(--surface); box-shadow: 0 0 0 1px var(--line); }
+/* highlight cards: the selected text vs. what you wrote about it; and the outline */
+.ann { padding: 10px; border-radius: 10px; cursor: pointer; border: 1px solid transparent; margin-bottom: 4px; }
+.ann.active { border-color: var(--line); background: var(--surface); } .ann.faded { opacity: .55; }
+.quote { font: italic 14px/1.45 var(--serif); padding: 4px 10px; border-left: 3px solid; border-radius: 0 6px 6px 0; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.note, .meta { margin-top: 6px; white-space: pre-wrap; }
+.reply { margin: 6px 0 0 10px; padding-left: 8px; border-left: 2px solid var(--line); font-size: 13px; white-space: pre-wrap; }
+.toc { display: flex; justify-content: space-between; gap: 8px; padding: 5px 8px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.toc.on { color: var(--text); font-weight: 600; }
+.toc span:last-child { display: flex; gap: 3px; flex-wrap: wrap; justify-content: flex-end; max-width: 40%; padding-top: 4px; }
+/* the note box: drag it from anywhere but its fields */
+.pop { position: fixed; z-index: 50; width: 300px; overflow: auto; border: 0; padding: 4px 10px 10px; cursor: grab; touch-action: none; user-select: none; }
+.pop:active { cursor: grabbing; } .pop textarea, .pop input { cursor: text; user-select: text; }
+.pop .row { height: 32px; gap: 8px; } .pop .row + .row { margin-top: 8px; height: auto; gap: 2px; } .pop .row input { flex: 1; height: 30px; }
+.swatch { width: 16px; height: 16px; border-radius: 50%; background: var(--c); box-shadow: 0 0 0 2px var(--surface); }
+.swatch.on { box-shadow: 0 0 0 2px var(--surface), 0 0 0 3.5px var(--c); }
+dialog { padding: 18px 20px; width: min(500px, calc(100vw - 32px)); } dialog::backdrop { background: rgba(0,0,0,.3); } dialog h2 { font-size: 16px; margin: 0 0 4px; }
+.cat-row { display: grid; grid-template-columns: 34px 1fr auto; gap: 10px; align-items: center; padding: 5px 0; }
+.cat-row input[type=color] { width: 34px; height: 30px; padding: 0; border: 0; background: none; cursor: pointer; }
+#toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 8px; z-index: 60; opacity: 0; transition: opacity .2s; pointer-events: none; }
+#toast.show { opacity: 1; }
+#elsewhere { position: fixed; inset: 0; z-index: 100; background: var(--bg); display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--muted); }
+#elsewhere[hidden] { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <a href="#/">paper index</a>
+  <input id="omni" placeholder="Search, or paste a link" autocomplete="off" spellcheck="false">
+  <span id="saved" class="hint" style="margin-left:auto"></span>
+  <button class="ghost" id="upload" title="Upload a PDF or saved web page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 16V4M7 9l5-5 5 5M5 20h14"/></svg></button>
+  <button class="ghost" id="settings-btn" title="Highlight colors"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg></button>
+  <input id="file" type="file" accept=".pdf,.html,.htm" hidden>
+</header>
+<main>
+  <aside id="left"><div class="label" id="list-label"></div><ul id="list"></ul></aside>
+  <section id="reader"></section>
+  <aside id="right"></aside>
+</main>
+<div class="pop" id="pop" hidden></div>
+<dialog id="settings">
+  <h2>Highlight colors</h2>
+  <p class="hint">What each color means. Selecting text uses the <b>default</b>; switch in the note box or with Alt+1…9.</p>
+  <div id="cat-rows"></div>
+  <div class="row" style="justify-content:flex-end;margin-top:10px"><span class="hint" id="settings-state"></span><button class="ghost" onclick="this.closest('dialog').close()">Done</button></div>
+</dialog>
+<div id="toast"></div>
+<div id="elsewhere" hidden><p>Paper Index is open in another tab.</p><button class="ghost on" id="use-here">Use here</button></div>
+<script>
+const $ = s => document.querySelector(s), $$ = s => document.querySelectorAll(s), enc = encodeURIComponent;
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+const tint = (hex, a) => `rgba(${[1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16))},${a})`;
+const ago = ts => { const s = Date.now() / 1000 - ts; return s < 3600 ? `${Math.max(1, s / 60 | 0)}m ago` : s < 86400 ? `${s / 3600 | 0}h ago` : s < 2592000 ? `${s / 86400 | 0}d ago` : new Date(ts * 1000).toLocaleDateString(); };
+const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+const stored = (k, v) => { try { return v === undefined ? JSON.parse(localStorage.getItem(k)) : v === null ? localStorage.removeItem(k) : localStorage.setItem(k, JSON.stringify(v)); } catch { return null; } };
+const reader = $('#reader'), pop = $('#pop'), omni = $('#omni');
+const state = { doc: null, docs: [], hits: null, searched: '', cats: [], defaultCat: null, view: null, frame: null, origin: null, frameToken: null,
+  ready: false, rect: null, popAnn: null, pinned: stored('pi-pop'), cameFrom: null, backTo: null, tab: 'highlights', layout: { order: [], sections: {}, headings: [], orphans: [] }, visible: [], heading: -1, token: 0 };
+let pendingSaves = 0, saveNotes, saveComment;
+
+// ---------- plumbing ----------
+async function call(action, args = {}) {  // the whole API: POST /api/<action> with JSON arguments (see server.py)
+  const r = await fetch(`/api/${action}`, args instanceof FormData ? { method: 'POST', body: args } : { method: 'POST', body: JSON.stringify(args), headers: { 'content-type': 'application/json' } });
+  if (!r.ok) throw new Error(await r.text() || r.statusText);
+  return r.json();
+}
+const docCall = (action, args = {}) => call(action, { key: state.doc.name, ...args });
+function toast(msg) { $('#toast').textContent = msg; $('#toast').classList.add('show'); clearTimeout(toast.t); toast.t = setTimeout(() => $('#toast').classList.remove('show'), 2600); }
+async function saving(promise) {  // every edit saves immediately; the header shows the state
+  pendingSaves++; $('#saved').textContent = 'Saving…';
+  try { const r = await promise; if (--pendingSaves === 0) $('#saved').textContent = 'Saved'; return r; }
+  catch (e) { pendingSaves--; $('#saved').textContent = 'Save failed'; toast(e.message); throw e; }
+}
+function debounce(fn, ms) {
+  let t, args;
+  const d = (...a) => { args = a; clearTimeout(t); t = setTimeout(() => { t = null; fn(...args); }, ms); };
+  d.flush = () => { if (t) { clearTimeout(t); t = null; fn(...args); } };
+  d.cancel = () => { clearTimeout(t); t = null; };
+  return d;
+}
+const flushAll = () => { saveComment?.flush(); saveNotes?.flush(); };
+addEventListener('beforeunload', e => { flushAll(); if (pendingSaves) e.preventDefault(); });
+const catOf = a => state.cats.find(c => c.id === a.color) || state.cats.find(c => c.id === state.defaultCat);
+const docHash = name => `#/doc/${enc(name)}`;
+const go = hash => location.hash === hash ? route() : (location.hash = hash);
+
+// ---------- one box: type to search (names, sites, words and meaning at once), or paste/enter a link to open it ----------
+const isLink = s => /^https?:\/\/\S+$/.test(s) || /^[\w-]+(\.[\w-]+)*\.[a-z]{2,}\/\S*$/i.test(s) || /^[\w-]+(\.[\w-]+)+\.[a-z]{2,}$/i.test(s);
+const item = (d, snippet = '', hash = docHash(d.name)) => `<li><a href="${hash}" class="${state.doc?.name === d.name ? 'on' : ''}"><div>${esc(d.title)}</div>
+  <div class="m">${esc(d.site || 'local')} · ${ago(d.created_at)}</div>${snippet}</a></li>`;
+async function refreshList() { state.docs = await call('list'); state.searched = ''; if (!omni.value.trim()) renderList(); }
+function renderList() {
+  const q = omni.value.trim(), hits = q && state.hits;
+  $('#list-label').textContent = q && isLink(q) ? 'Open link' : hits ? (hits.length ? 'Results' : `No results for “${q}”`) : 'Library';
+  $('#list').innerHTML = q && isLink(q) ? `<li><a href="#" data-open><div>Open ${esc(q)}</div><div class="m">Enter</div></a></li>`
+    : hits ? hits.map(h => item(h.doc, h.snippet ? `<div class="s">${h.ann_id ? '✎ ' : ''}${esc(h.snippet).replace(/\x02/g, '<b>').replace(/\x03/g, '</b>')}</div>` : '',
+                                docHash(h.doc.name) + (h.ann_id > 0 ? `/a/${h.ann_id}` : ''))).join('')
+    : state.docs.map(d => item(d)).join('') || '<p class="hint" style="padding:0 18px">Paste a link anywhere to save your first page.</p>';
+  $('#list a')?.classList.toggle('kbd', !!q);  // Enter opens the first result
+}
+async function search() {
+  const q = omni.value.trim();
+  if (!q || isLink(q) || q === state.searched) return renderList();
+  const hits = await call('search', { q }).catch(e => (toast(e.message), []));
+  if (omni.value.trim() === q) Object.assign(state, { hits, searched: q }), renderList();  // ignore answers to older queries
+}
+const runSearch = debounce(search, 180);
+omni.oninput = () => { if (!omni.value.trim()) Object.assign(state, { hits: null, searched: '' }); runSearch(); };
+omni.onkeydown = async e => {
+  if (e.key === 'Escape') { omni.value = ''; omni.oninput(); omni.blur(); }
+  if (e.key !== 'Enter') return;
+  if (isLink(omni.value.trim())) return openLink(omni.value.trim());
+  runSearch.cancel(); await search();  // the top result for what was typed, not for an older query
+  if (state.hits?.length) { omni.blur(); go($('#list a').getAttribute('href')); }
+};
+$('#list').onclick = e => {
+  const a = e.target.closest('a');
+  if (a?.hasAttribute('data-open')) { e.preventDefault(); openLink(omni.value.trim()); }
+  else if (a?.getAttribute('href') === location.hash) route();  // same result again: jump to it again
+};
+const typing = () => document.activeElement.matches('input, textarea, [contenteditable]');
+const focusSearch = () => { omni.focus(); omni.select(); };
+document.addEventListener('keydown', e => {
+  if (e.key === '/' && !typing() && !e.ctrlKey && !e.metaKey) { e.preventDefault(); focusSearch(); }
+  if (e.key === 'Escape') { hidePop(); closeMenu(); }
+});
+document.addEventListener('paste', e => {  // Ctrl/⌘+V with a link anywhere (or into the empty box) opens it
+  const t = e.clipboardData.getData('text').trim();
+  if ((!typing() && /^https?:\/\/\S+$/.test(t)) || (document.activeElement === omni && !omni.value && isLink(t))) { e.preventDefault(); openLink(t); }
+});
+
+// ---------- opening things ----------
+async function openLink(url, followed = false) {
+  const from = state.doc;
+  omni.value = ''; omni.blur(); omni.oninput(); hidePop();
+  reader.innerHTML = `<div class="loading">Opening ${esc(url)}…</div>`;
+  try {
+    const d = await call('open', { url });
+    if (!d.created && !followed) toast('Already saved');
+    state.cameFrom = followed && from ? { name: from.name, title: from.title } : null;
+    await refreshList();
+    location.hash === docHash(d.name) ? openDoc(d.name) : go(docHash(d.name));
+  } catch (e) { toast(e.message); from ? openDoc(from.name, true) : showHome(); }
+}
+$('#upload').onclick = () => $('#file').click();
+$('#file').onchange = async e => {
+  const fd = new FormData(), file = e.target.files[0];
+  if (!file) return;
+  fd.append('file', file); e.target.value = '';
+  try { const d = await call('upload', fd); await refreshList(); go(docHash(d.name)); } catch (err) { toast(err.message); }
+};
+async function route() {
+  here({ hash: location.hash });
+  const m = location.hash.match(/^#\/doc\/([^/]+)(?:\/a\/(\d+))?/);
+  if (!m) return showHome();
+  if (state.doc?.name !== decodeURIComponent(m[1])) await openDoc(decodeURIComponent(m[1]));
+  if (m[2]) focusAnn(+m[2]);
+}
+addEventListener('hashchange', route);
+function showHome() {
+  flushAll(); hidePop(); state.token++; state.doc = state.frame = null;
+  reader.innerHTML = '<div class="empty"><h2>Read, highlight, remember.</h2><p>Paste a link anywhere to open it · <kbd>/</kbd> to search · select text to highlight</p></div>';
+  $('#right').innerHTML = '';
+  renderList();
+}
+async function openDoc(name, keepView) {
+  flushAll(); hidePop();
+  const token = ++state.token;
+  if (state.cameFrom) [state.backTo, state.cameFrom] = [state.cameFrom, null]; else if (!keepView) state.backTo = null;
+  reader.innerHTML = '<div class="loading">Opening…</div>';
+  const d = await call('get', { key: name }).catch(e => { toast(e.message); location.hash = '#/'; });
+  if (!d || token !== state.token) return;
+  // Each doc lives on its own origin (<name>.localhost), so the page's scripts can't reach this app.
+  Object.assign(state, { doc: d, ready: false, frameToken: null, layout: { order: [], sections: {}, headings: [], orphans: [] }, visible: [], heading: -1,
+    origin: `${location.protocol}//${d.name}.localhost:${location.port}`, view: keepView ? state.view : d.kind === 'pdf' ? 'pdf' : d.url ? 'live' : 'reader' });
+  const u = d.url && new URL(d.url);
+  reader.innerHTML = `<div class="bar row" id="bar"></div><iframe src="${esc(state.origin + (state.view === 'live' ? u.pathname + u.search + u.hash : '/__pi/' + state.view))}"
+    sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox" allow="fullscreen; autoplay; clipboard-write; encrypted-media; picture-in-picture"></iframe>`;
+  state.frame = reader.querySelector('iframe');
+  renderBar(); renderRight(); renderList();
+}
+function renderBar() {
+  const d = state.doc, views = d.kind !== 'pdf' && d.url ? ['live', 'reader'] : [];
+  $('#bar').innerHTML = `${state.backTo ? `<a class="ghost" href="${docHash(state.backTo.name)}" title="Back to ${esc(state.backTo.title)}">←</a>` : ''}
+    <h1 title="${esc(d.title)}">${esc(d.title)}</h1>
+    ${d.url ? `<a class="ghost" href="${esc(d.url)}" target="_blank" rel="noopener" title="Open the original">${esc(d.site)} ↗</a>` : ''}
+    ${views.map(v => `<button class="ghost${v === state.view ? ' on' : ''}" data-act="view" data-view="${v}">${v === 'live' ? 'Live' : 'Reader'}</button>`).join('')}
+    <button class="ghost" data-act="menu" title="More">⋯</button>`;
+}
+const closeMenu = () => $('.menu')?.remove();
+const actions = {
+  menu: () => $('.menu') ? closeMenu() : $('#bar').insertAdjacentHTML('beforeend', `<div class="popup menu">
+    <button data-act="rename">Rename…</button>
+    <button data-act="delete" style="color:var(--danger)">Delete</button></div>`),
+  view: b => { state.view = b.dataset.view; openDoc(state.doc.name, true); },
+  rename: async () => {
+    const d = state.doc, name = prompt('Lookup key (lowercase-with-dashes):', d.name);
+    if (!name || name === d.name) return;
+    const r = await saving(docCall('rename', { name, title: prompt('Title:', d.title) || d.title }));
+    state.doc = null; await refreshList(); go(docHash(r.name));
+  },
+  delete: async () => {
+    if (!confirm(`Delete “${state.doc.title}” and its ${state.doc.annotations.length} highlights?`)) return;
+    await saving(docCall('delete'));
+    state.doc = null; await refreshList(); go('#/');
+  },
+};
+document.addEventListener('click', e => {
+  const b = e.target.closest('#reader [data-act]');
+  if (b?.dataset.act !== 'menu') closeMenu();
+  if (b) actions[b.dataset.act](b)?.catch?.(() => {});
+});
+
+// ---------- the doc frame (static/annotator.js) ----------
+const post = msg => state.frame?.contentWindow?.postMessage({ pi: 1, ...msg }, state.origin);
+const syncFrame = () => state.ready && post({ type: 'anns', cats: state.cats, def: state.defaultCat, anns: state.doc.annotations });
+const focusAnn = (id, tries = 40) => state.ready ? post({ type: 'focus', id }) : tries && setTimeout(() => focusAnn(id, tries - 1), 250);
+const fromFrame = {
+  hello: m => { state.frameToken ||= m.token; },  // the first hello comes from our annotator, before any page script
+  ready: m => { state.ready = true; syncFrame(); if (!m.highlights) toast('This browser cannot show highlights; try a recent Chrome, Firefox or Safari.'); },
+  layout: m => { state.layout = m; renderAnnList(); },
+  scrolled: m => { state.visible = m.visible; state.heading = m.heading; applyScroll(); },
+  down: () => { hidePop(); closeMenu(); },
+  rect: () => placePop(),
+  search: focusSearch,
+  missing: () => toast('That highlight is not on this page'),
+  'click-ann': m => { const a = state.doc.annotations.find(x => x.id === m.id); if (a) showPop(a); },
+  select: ({ type, rect, pi, token, ...selected }) => {  // a draft highlight with the note box open; kept once you write or pick a color
+    hidePop();
+    const a = { id: -1, draft: true, color: state.defaultCat, comment: '', created_at: Date.now() / 1000, ...selected };
+    state.doc.annotations.push(a);
+    post({ type: 'clear-selection' }); syncFrame(); post({ type: 'track', id: -1 }); showPop(a, true);
+  },
+  open: m => openLink(m.url),
+  link: m => m.newTab ? open(m.href, '_blank', 'noopener') : openLink(m.href, true),
+};
+addEventListener('message', e => {
+  const m = e.data;
+  if (!state.frame || e.source !== state.frame.contentWindow || e.origin !== state.origin || !m?.pi) return;
+  if ((m.type === 'open' || m.type === 'link') && m.token !== state.frameToken) return;  // page scripts can't make us fetch things
+  if (m.rect) state.rect = m.rect;
+  fromFrame[m.type]?.(m);
+});
+
+// ---------- the note box: follows the selection without covering it, or stays where you drag it ----------
+function placePop() {
+  if (pop.hidden || !state.frame) return;
+  pop.style.visibility = ''; pop.style.maxHeight = '';
+  const w = pop.offsetWidth, h = pop.offsetHeight, m = 8, gap = 10, f = state.frame.getBoundingClientRect();
+  if (state.pinned) return Object.assign(pop.style, { left: `${clamp(state.pinned.x, m, innerWidth - w - m)}px`, top: `${clamp(state.pinned.y, m, innerHeight - h - m)}px` });
+  if (!state.rect) return;
+  const r = { left: state.rect.left + f.left, right: state.rect.right + f.left, top: state.rect.top + f.top, bottom: state.rect.bottom + f.top };
+  if (r.bottom < 0 || r.top > innerHeight) return void (pop.style.visibility = 'hidden');
+  const room = { below: innerHeight - r.bottom - gap - m, above: r.top - gap - m, right: innerWidth - r.right - gap - m, left: r.left - gap - m };
+  const side = ['below', 'above'].find(s => room[s] >= h) || ['right', 'left'].find(s => room[s] >= w) || (room.below >= room.above ? 'below' : 'above');
+  if (side === 'right' || side === 'left')
+    return Object.assign(pop.style, { left: `${side === 'right' ? r.right + gap : r.left - gap - w}px`, top: `${clamp(r.top, m, innerHeight - h - m)}px` });
+  if (h > room[side]) pop.style.maxHeight = `${Math.max(120, room[side])}px`;
+  Object.assign(pop.style, { top: `${side === 'below' ? r.bottom + gap : r.top - gap - pop.offsetHeight}px`, left: `${clamp(r.left, m, innerWidth - w - m)}px` });
+}
+addEventListener('resize', placePop);
+const grabbable = e => !e.target.closest('textarea, input, button');
+pop.onpointerdown = e => {  // drag from anywhere but the fields and buttons; double-click to follow the text again
+  if (!grabbable(e) || e.button) return;
+  e.preventDefault();
+  const r = pop.getBoundingClientRect(), dx = e.clientX - r.left, dy = e.clientY - r.top;
+  pop.setPointerCapture(e.pointerId);  // keeps the drag going over the page frame
+  pop.onpointermove = ev => { state.pinned = { x: ev.clientX - dx, y: ev.clientY - dy }; placePop(); };
+  pop.onpointerup = () => { pop.onpointermove = null; stored('pi-pop', state.pinned); };
+};
+pop.ondblclick = e => { if (grabbable(e)) { state.pinned = null; stored('pi-pop', null); placePop(); } };
+function hidePop() {
+  if (pop.hidden) return;
+  saveComment?.flush();
+  const a = state.popAnn;
+  pop.hidden = true; state.popAnn = null; post({ type: 'track', id: null });
+  if (a?.draft && !firstSave.has(a)) discard(a);  // dismissed without a note or a color: not kept
+}
+function discard(a) { state.doc.annotations = state.doc.annotations.filter(x => x !== a); syncFrame(); renderAnnList(); }
+
+// A draft is saved the first time you act on it; edits to a highlight go out one at a time, in order.
+const firstSave = new WeakMap(), queue = new WeakMap();
+function ensureSaved(a, key = state.doc.name) {  // key is taken when the edit is made, not when it's sent
+  if (!firstSave.has(a)) firstSave.set(a, !a.draft ? Promise.resolve() : saving(call('highlight',
+    { key, start: a.start, end: a.end, quote: a.quote, page: a.page, view: a.view, color: a.color, comment: a.comment })).then(saved => {
+      Object.assign(a, saved); delete a.draft;
+      syncFrame(); renderAnnList(); refreshList();
+      if (state.popAnn === a) { post({ type: 'track', id: a.id }); renderPopMore(a); }  // the note box itself is left alone
+    }));
+  return firstSave.get(a);
+}
+function patchAnn(a, body) {
+  const key = state.doc.name;
+  const p = (queue.get(a) || Promise.resolve()).then(() => ensureSaved(a, key)).then(() => saving(call('edit_highlight', { key, ann_id: a.id, ...body })));
+  queue.set(a, p.catch(() => {}));
+  return p;
+}
+function showPop(a, focus) {
+  if (state.popAnn !== a) saveComment?.flush();
+  state.popAnn = a;
+  pop.innerHTML = `<div class="row">${state.cats.map(c => `<button class="swatch" data-cat="${c.id}" title="${esc(c.label)}" style="--c:${c.color}"></button>`).join('')}
+    <span class="hint" id="cat-label"></span></div>
+    <textarea placeholder="${a.draft ? 'Note… (or pick a color to keep it as a plain highlight)' : 'Note…'}">${esc(a.comment)}</textarea><div id="pop-more"></div>`;
+  const ta = pop.querySelector('textarea');
+  saveComment = debounce(comment => patchAnn(a, { comment }).catch(() => {}), 500);
+  ta.oninput = () => { a.comment = ta.value; syncFrame(); renderAnnList(); saveComment(ta.value); };
+  ta.onkeydown = e => {
+    if (e.key === 'Escape' || (e.key === 'Enter' && (e.metaKey || e.ctrlKey))) hidePop();
+    if (e.altKey && state.cats[e.key - 1]) { e.preventDefault(); setCat(a, state.cats[e.key - 1].id); }
+  };
+  pop.hidden = false;
+  markCat(a); renderPopMore(a);
+  if (focus) setTimeout(() => { ta.focus({ preventScroll: true }); ta.setSelectionRange(ta.value.length, ta.value.length); });
+}
+function renderPopMore(a) {  // replies, resolve and remove appear once the highlight is saved
+  $('#pop-more').innerHTML = a.draft ? '' : `${(a.replies || []).map(r => `<div class="reply">${esc(r.text)}</div>`).join('')}
+    <div class="row"><input placeholder="Reply…" id="reply"><button class="ghost" data-pop="resolve" title="${a.resolved ? 'Reopen' : 'Resolve'}">${a.resolved ? '↺' : '✓'}</button>
+    <button class="ghost" data-pop="remove" title="Remove highlight">✕</button></div>`;
+  pop.querySelectorAll('button').forEach(b => b.onmousedown = e => e.preventDefault());  // keep typing focus
+  if ($('#reply')) $('#reply').onkeydown = async e => {
+    const text = e.target.value.trim();
+    if (e.key !== 'Enter' || !text) return;
+    e.target.value = '';
+    Object.assign(a, await patchAnn(a, { reply: text }));
+    if (state.popAnn === a) { renderPopMore(a); $('#reply').focus(); }
+    renderAnnList();
+  };
+  placePop();
+}
+function markCat(a) { pop.querySelectorAll('.swatch').forEach(b => b.classList.toggle('on', b.dataset.cat === catOf(a).id)); $('#cat-label').textContent = catOf(a).label; }
+function setCat(a, id) {  // only the swatches change, so typing focus stays in the note
+  const unsaved = a.draft && !firstSave.has(a);
+  a.color = id; syncFrame(); renderAnnList(); markCat(a);
+  (unsaved ? ensureSaved(a) : patchAnn(a, { color: id })).catch(() => {});
+}
+pop.onclick = async e => {
+  const a = state.popAnn, b = e.target.closest('[data-cat], [data-pop]');
+  if (!a || !b) return;
+  if (b.dataset.cat) return setCat(a, b.dataset.cat);
+  if (b.dataset.pop === 'resolve') { a.resolved = !a.resolved; patchAnn(a, { resolved: a.resolved }).catch(() => {}); syncFrame(); renderAnnList(); hidePop(); }
+  if (b.dataset.pop === 'remove') {
+    saveComment?.cancel(); saveComment = null;  // a pending note save would otherwise hit the deleted highlight
+    hidePop(); discard(a);
+    await saving(docCall('remove_highlight', { ann_id: a.id })).then(refreshList).catch(() => {});
+  }
+};
+
+// ---------- side panel: notes, then highlights (page order) or the outline, both following what you read ----------
+function renderRight() {
+  const d = state.doc;
+  $('#right').innerHTML = `<div class="label" style="padding-left:0">Notes</div><textarea id="notes" placeholder="Your thoughts on this ${d.kind === 'pdf' ? 'paper' : 'page'}…">${esc(d.notes)}</textarea>
+    <div class="row" style="margin:14px 0 8px">${['highlights', 'outline'].map(t => `<button class="ghost${state.tab === t ? ' on' : ''}" data-tab="${t}">${t === 'highlights' ? 'Highlights <span id="count"></span>' : 'Outline'}</button>`).join('')}</div><ul id="anns"></ul>`;
+  saveNotes = debounce(notes => saving(call('notes', { key: d.name, notes })).catch(() => {}), 600);
+  $('#notes').oninput = e => { d.notes = e.target.value; saveNotes(d.notes); };
+  renderAnnList();
+}
+function renderAnnList() {
+  if (!$('#anns') || !state.doc) return;
+  const { order, sections, headings, orphans } = state.layout, rank = new Map(order.map((id, i) => [id, i]));
+  const shown = state.doc.annotations.filter(a => !a.draft)  // drafts show up once kept
+    .sort((x, y) => (rank.get(x.id) ?? 1e9) - (rank.get(y.id) ?? 1e9) || (x.page || 0) - (y.page || 0) || x.start - y.start);
+  $('#count').textContent = shown.length || '';
+  const dot = a => `<span class="dot" style="background:${catOf(a).color}"></span>`;
+  $('#anns').innerHTML = state.tab === 'outline'
+    ? headings.map((h, i) => `<li class="toc" data-h="${i}" style="padding-left:${h.level * 14 - 6}px"><span>${esc(h.text)}</span><span>${shown.filter(a => sections[a.id] === i).map(dot).join('')}</span></li>`).join('')
+      || '<p class="hint">No headings on this page.</p>'
+    : shown.map(a => { const c = catOf(a), lost = orphans.includes(a.id); return `<li class="ann${lost || a.resolved ? ' faded' : ''}" data-id="${a.id}">
+        <div class="quote" style="border-color:${c.color};background:${tint(c.color, .14)}">${esc(a.quote.trim())}</div>
+        ${a.comment ? `<div class="note">${esc(a.comment)}</div>` : ''}${(a.replies || []).map(r => `<div class="reply">${esc(r.text)}</div>`).join('')}
+        <div class="meta">${esc(c.label)}${a.page ? ` · p. ${a.page}` : ''}${a.resolved ? ' · resolved' : ''}${lost ? ' · not on this page' : ''}</div></li>`; }).join('')
+      || '<p class="hint">Select text to highlight it.</p>';
+  applyScroll();
+}
+function applyScroll() {  // mark what's on screen; keep it in view in the panel unless you're using the panel
+  $$('.ann').forEach(li => li.classList.toggle('active', state.visible.includes(+li.dataset.id)));
+  $$('.toc').forEach(li => li.classList.toggle('on', +li.dataset.h === state.heading));
+  if (Date.now() - (state.panelTouched || 0) > 2500) $('#right .ann.active, #right .toc.on')?.scrollIntoView({ block: 'nearest' });
+}
+$('#right').onclick = e => {
+  const t = e.target.closest('[data-tab], .toc, .ann');
+  if (t?.dataset.tab) { state.tab = t.dataset.tab; $$('[data-tab]').forEach(b => b.classList.toggle('on', b === t)); renderAnnList(); }
+  else if (t?.classList.contains('toc')) post({ type: 'goto', heading: +t.dataset.h });
+  else if (t) focusAnn(+t.dataset.id);
+};
+['wheel', 'pointerdown'].forEach(ev => $('#right').addEventListener(ev, () => state.panelTouched = Date.now(), { passive: true }));
+
+// ---------- settings: what each color means ----------
+let draft;
+const saveSettings = debounce(() => call('save_settings', draft).then(s => { applySettings(s); $('#settings-state').textContent = 'Saved'; }, e => $('#settings-state').textContent = e.message), 400);
+function applySettings(s) {
+  state.cats = s.categories; state.defaultCat = s.default;
+  syncFrame(); renderAnnList();
+  if (state.popAnn && !pop.hidden) markCat(state.popAnn);
+}
+$('#settings-btn').onclick = () => {
+  draft = { categories: state.cats.map(c => ({ ...c })), default: state.defaultCat };
+  $('#cat-rows').innerHTML = draft.categories.map((c, i) => `<div class="cat-row" data-i="${i}"><input type="color" value="${c.color}">
+    <input type="text" value="${esc(c.label)}" maxlength="40"><label class="hint"><input type="radio" name="def" ${c.id === draft.default ? 'checked' : ''}> default</label></div>`).join('');
+  $('#settings-state').textContent = '';
+  $('#settings').showModal();
+};
+$('#settings').onclose = () => saveSettings.flush();
+$('#cat-rows').oninput = e => {
+  const c = draft.categories[e.target.closest('.cat-row').dataset.i];
+  if (e.target.type === 'radio') draft.default = c.id; else c[e.target.type === 'color' ? 'color' : 'label'] = e.target.value;
+  saveSettings();
+};
+
+// ---------- one live tab: the newest one claims it; the others step aside until you click "Use here" ----------
+const TAB = crypto.randomUUID();
+const here = (args = {}) => call('here', { tab: TAB, ...args }).then(s => {
+  if (s.tab === TAB || !$('#elsewhere').hidden) return;
+  flushAll(); hidePop(); $('#elsewhere').hidden = false;
+}).catch(() => {});
+$('#use-here').onclick = async () => {
+  await here({ claim: true, hash: location.hash }); $('#elsewhere').hidden = true;
+  await refreshList(); state.doc ? openDoc(state.doc.name, true) : route();  // pick up what changed in the other tab
+};
+setInterval(here, 2000);
+document.addEventListener('visibilitychange', () => document.hidden || here());
+
+call('settings').then(applySettings).finally(() => here({ claim: true, hash: location.hash }).then(refreshList).then(route));
+</script>
+</body>
+</html>
