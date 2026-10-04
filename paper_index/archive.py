@@ -1,51 +1,36 @@
-"""If the library folder is inside a git repo, it's an archive: a minute after your last change, each changed
-article is committed as `saved "<title>"` (or `removed "<name>"`) and pushed. Saves from your other machines are
-pulled when the server starts, every few minutes, and before each push."""
+"""If the library folder is inside a git repo, it's an archive. Every COMMIT_MINUTES (and when the server starts),
+each changed article is committed as `saved "<title>"` (or `removed "<name>"`) and pushed. Saves from your other
+machines are pulled every PULL_MINUTES."""
 from __future__ import annotations
 
 import subprocess
 import threading
+import time
 from pathlib import PurePosixPath
 
 from . import store
 
-QUIET_SECONDS = 60
+COMMIT_MINUTES = 120
 PULL_MINUTES = 10
 IGNORE = "docs/*/archive/\ndocs/*/vectors*.npz\nsession.json\n*.tmp\n"  # caches: big, and rebuilt on demand
-_timer: threading.Timer | None = None
-_lock, _git_lock = threading.Lock(), threading.Lock()  # _git_lock: commits and pulls never overlap
+_lock = threading.Lock()  # git operations never overlap
+_last_commit = 0.0
 
 
 def git(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(store.HOME), *args], capture_output=True, text=True)
 
 
-def changed() -> None:
-    """Call after every change; commits once things have been quiet for QUIET_SECONDS."""
-    global _timer
-    with _lock:
-        if _timer:
-            _timer.cancel()
-        _timer = threading.Timer(QUIET_SECONDS, commit)
-        _timer.daemon = True
-        _timer.start()
-
-
-def in_repo() -> bool:
-    return git("rev-parse", "--is-inside-work-tree").stdout.strip() == "true"
-
-
-def pull() -> None:
-    """Bring in saves from your other machines. If they can't be combined cleanly, keep ours and try again later."""
-    if git("pull", "--rebase", "--autostash", "-q").returncode:
-        git("rebase", "--abort")
-
-
 def keep_in_sync() -> None:
-    """Pull now, and every PULL_MINUTES while the server runs; also push saves an earlier push didn't get out."""
-    if in_repo():
-        with _git_lock:
-            pull()
+    """Commit if it's time (always on the first run), pull, push; then again in PULL_MINUTES."""
+    global _last_commit
+    with _lock:
+        if git("rev-parse", "--is-inside-work-tree").stdout.strip() == "true":
+            if time.time() - _last_commit >= COMMIT_MINUTES * 60:
+                commit()
+                _last_commit = time.time()
+            if git("pull", "--rebase", "--autostash", "-q").returncode:  # can't combine cleanly: keep ours, retry later
+                git("rebase", "--abort")
             git("push", "-q")
     timer = threading.Timer(PULL_MINUTES * 60, keep_in_sync)
     timer.daemon = True
@@ -53,12 +38,7 @@ def keep_in_sync() -> None:
 
 
 def commit() -> None:
-    with _git_lock:
-        if in_repo():
-            _commit()
-
-
-def _commit() -> None:
+    """One commit per changed article; other changes (settings, the .gitignore) get their own."""
     if not (store.HOME / ".gitignore").exists():
         store.write(store.HOME / ".gitignore", IGNORE)
     library = PurePosixPath(git("rev-parse", "--show-prefix").stdout.strip())  # the library's path inside the repo
@@ -69,9 +49,7 @@ def _commit() -> None:
             groups.setdefault(parts[1] if parts[0] == "docs" and len(parts) > 2 else "", []).append(str(PurePosixPath(*parts)))
     for name, paths in groups.items():
         title = store.read(store.DOCS / name / "meta.json", {}).get("title") if name else None
-        message = f'saved "{title}"' if title else f'removed "{name}"' if name else "saved settings"
+        message = f'saved "{title}"' if title else f'removed "{name}"' if name else \
+            "saved settings" if "settings.json" in paths else "set up library"
         git("add", "-A", "--", *paths)
         git("commit", "-q", "-m", message, "--", *paths)
-    if groups:
-        pull()  # another machine may have pushed meanwhile
-        git("push", "-q")

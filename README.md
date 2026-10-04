@@ -39,8 +39,8 @@ last setup step:
 PAPER_INDEX_HOME=$PWD/library paper-index install
 ```
 
-A minute after your last change, each changed article is committed as `saved "<title>"` and pushed. Saves from your
-other laptops are pulled when it starts and every 10 minutes.
+Every 2 hours (and when it starts), each changed article is committed as `saved "<title>"` and pushed. Saves from
+your other laptops are pulled every 10 minutes.
 
 ## Settings
 

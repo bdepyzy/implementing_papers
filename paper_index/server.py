@@ -23,7 +23,6 @@ ACTIONS = {
     "highlight": store.highlight, "edit_highlight": store.edit_highlight, "remove_highlight": store.remove_highlight,
 }
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
-READ_ONLY = {"settings", "list", "search", "get", "here"}  # every other action changes the library
 app = FastAPI(title="paper-index")
 for error, status in ((store.NotFound, 404), (ValueError, 400), (TypeError, 400), (requests.RequestException, 502)):
     app.add_exception_handler(error, lambda _, e, status=status: PlainTextResponse(str(e), status))
@@ -50,10 +49,7 @@ async def route(request: Request, call_next):
     origin = request.headers.get("origin")  # pages shown in a doc frame must not be able to change your library
     if request.method != "GET" and origin and urlsplit(origin).netloc != host:
         return PlainTextResponse("cross-origin request refused", 403)
-    response = await call_next(request)
-    if request.method == "POST" and response.status_code == 200 and request.url.path.removeprefix("/api/") not in READ_ONLY:
-        archive.changed()
-    return response
+    return await call_next(request)
 
 
 @app.get("/", response_class=HTMLResponse)
