@@ -5,7 +5,7 @@ Save web pages and PDFs, highlight them, take notes, and search them later.
 ## Setup
 
 ```bash
-git clone <repo-url> paper-index
+git clone https://github.com/bdepyzy/implementing_papers.git paper-index
 cd paper-index
 uv tool install -e .
 paper-index install
