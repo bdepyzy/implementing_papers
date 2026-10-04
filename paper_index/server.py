@@ -13,7 +13,7 @@ from fastapi import Body, FastAPI, File, Request, UploadFile
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import ingest, proxy, search, store
+from . import archive, ingest, proxy, search, store
 
 ACTIONS = {
     "settings": store.load_settings, "save_settings": lambda **s: store.save_settings(s),
@@ -23,6 +23,7 @@ ACTIONS = {
     "highlight": store.highlight, "edit_highlight": store.edit_highlight, "remove_highlight": store.remove_highlight,
 }
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
+READ_ONLY = {"settings", "list", "search", "get", "here"}  # every other action changes the library
 app = FastAPI(title="paper-index")
 for error, status in ((store.NotFound, 404), (ValueError, 400), (TypeError, 400), (requests.RequestException, 502)):
     app.add_exception_handler(error, lambda _, e, status=status: PlainTextResponse(str(e), status))
@@ -31,6 +32,7 @@ for error, status in ((store.NotFound, 404), (ValueError, 400), (TypeError, 400)
 @app.on_event("startup")
 def startup() -> None:
     threading.Thread(target=search.model, daemon=True).start()  # load the embedding model in the background
+    threading.Thread(target=archive.keep_in_sync, daemon=True).start()
 
 
 @app.middleware("http")
@@ -48,7 +50,10 @@ async def route(request: Request, call_next):
     origin = request.headers.get("origin")  # pages shown in a doc frame must not be able to change your library
     if request.method != "GET" and origin and urlsplit(origin).netloc != host:
         return PlainTextResponse("cross-origin request refused", 403)
-    return await call_next(request)
+    response = await call_next(request)
+    if request.method == "POST" and response.status_code == 200 and request.url.path.removeprefix("/api/") not in READ_ONLY:
+        archive.changed()
+    return response
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -71,20 +71,20 @@ def fetch(url: str) -> tuple[str, dict, str | None]:
     return "html", parse_html(r.text, url), r.text
 
 
-def add_url(url: str, name=None) -> dict:
+def add_url(url: str) -> dict:
     """The doc for this URL, with created=False if it was already saved."""
     url = url.strip() if re.match(r"https?://", url.strip()) else "https://" + url.strip()
     if p := store.find_by_url(url):
         return store.meta(p) | {"created": False}
     kind, parsed, raw = fetch(url)
-    doc = store.add_doc(kind=kind, url=url, name=name, **parsed)
+    doc = store.add_doc(kind=kind, url=url, **parsed)
     if raw:
         proxy.prime(doc["name"], url, raw)  # the first Live view is instant and works offline
     return doc | {"created": True}
 
 
-def add_file(data: bytes, filename: str, name=None) -> dict:
+def add_file(data: bytes, filename: str) -> dict:
     """An uploaded PDF or saved web page (.html)."""
     if filename.lower().endswith(".pdf") or data[:5] == b"%PDF-":
-        return store.add_doc(kind="pdf", name=name, **parse_pdf(data, filename))
-    return store.add_doc(kind="html", name=name, **parse_html(data.decode("utf-8", errors="replace"), "about:blank"))
+        return store.add_doc(kind="pdf", **parse_pdf(data, filename))
+    return store.add_doc(kind="html", **parse_html(data.decode("utf-8", errors="replace"), "about:blank"))

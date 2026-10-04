@@ -83,56 +83,18 @@ def install() -> None:
                     f"Environment=PAPER_INDEX_HOME={store.HOME}\nEnvironment=PAPER_INDEX_PORT={store.PORT}\n"
                     "Restart=on-failure\n\n[Install]\nWantedBy=default.target\n")
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-    subprocess.run(["systemctl", "--user", "enable", "--now", "paper-index"], check=False)
+    subprocess.run(["systemctl", "--user", "enable", "paper-index"], check=False)
+    subprocess.run(["systemctl", "--user", "restart", "paper-index"], check=False)  # pick up new settings
     print(f"Added to your app launcher ({entry}) and started the background service ({unit}).")
-
-
-def show(d: dict) -> str:
-    lines = [d["title"], d.get("url") or "", d["notes"]]
-    for a in d["annotations"]:
-        lines += [f"\n  [{a['color']}] “{' '.join(a['quote'].split())}”", *([f"    {a['comment']}"] if a["comment"] else []),
-                  *(f"    ↳ {r['text']}" for r in a.get("replies", []))]
-    return "\n".join(line for line in lines if line)
 
 
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="paper-index", description=__doc__)
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("open", help="open the app in your browser (the default)")
-    sub.add_parser("serve", help="run just the server (what the background service runs)")
     sub.add_parser("install", help="run it in the background and add it to your app launcher")
-    p = sub.add_parser("add", help="save a URL, or a local PDF or .html file")
-    p.add_argument("source")
-    p.add_argument("--name")
-    sub.add_parser("get", help="show a doc's notes and highlights (by name, partial name, URL or title)").add_argument("key")
-    sub.add_parser("ls", help="list saved docs")
-    sub.add_parser("search", help="search docs, highlights and notes").add_argument("query", nargs="+")
-    sub.add_parser("rm", help="delete a doc").add_argument("key")
-    a = ap.parse_args(argv)
+    sub.add_parser("serve", help="run just the server (what the background service runs)")
     try:
-        if a.cmd in (None, "open"):
-            open_app()
-        elif a.cmd == "serve":
-            serve()
-        elif a.cmd == "install":
-            install()
-        elif a.cmd == "add":
-            from . import ingest
-            path = Path(a.source).expanduser()
-            doc = ingest.add_file(path.read_bytes(), path.name, a.name) | {"created": True} if path.is_file() else ingest.add_url(a.source, a.name)
-            print(("saved as " if doc["created"] else "already saved as ") + doc["name"])
-        elif a.cmd == "get":
-            print(show(store.get_doc(a.key)))
-        elif a.cmd == "ls":
-            print("\n".join(f"{d['name']:<40} {d.get('site') or 'local':<22} {d['title'][:70]}" for d in store.list_docs()))
-        elif a.cmd == "search":
-            from . import search
-            for h in search.search(" ".join(a.query), 10):
-                snippet = (h["snippet"] or "").replace(search.MARK_OPEN, "\033[1m").replace(search.MARK_CLOSE, "\033[0m")
-                print(f"{h['doc']['name']:<40} {h['doc']['title'][:70]}\n    {' '.join(snippet.split())[:240]}")
-        elif a.cmd == "rm":
-            store.delete(a.key)
-    except (store.NotFound, ValueError) as e:
-        sys.exit(str(e))
+        {"install": install, "serve": serve}.get(ap.parse_args(argv).cmd, open_app)()
     except KeyboardInterrupt:
         pass

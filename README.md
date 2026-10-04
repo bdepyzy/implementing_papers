@@ -28,21 +28,25 @@ shortcut can always find it.
 - Click a highlight to reply, resolve or remove it.
 - ⚙ sets what each color means.
 
-## Command line
+## Your library
+
+By default your library is in `~/.paper_index`, so anyone who clones this repo starts with an empty one.
+
+To keep your library in this repo instead, and have it on every laptop you set up this way, use this in place of the
+last setup step:
 
 ```bash
-paper-index add <url-or-file>
-paper-index get <name>
-paper-index ls
-paper-index search <query>
-paper-index rm <name>
+PAPER_INDEX_HOME=$PWD/library paper-index install
 ```
+
+A minute after your last change, each changed article is committed as `saved "<title>"` and pushed. Saves from your
+other laptops are pulled when it starts and every 10 minutes.
 
 ## Settings
 
 | Variable | Default |
 |---|---|
-| `PAPER_INDEX_HOME` | `~/.paper_index` (your data, as plain files) |
+| `PAPER_INDEX_HOME` | `~/.paper_index` (your library, as plain files) |
 | `PAPER_INDEX_PORT` | `8765` |
 
 Set them before running `paper-index install`.

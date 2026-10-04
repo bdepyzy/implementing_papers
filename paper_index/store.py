@@ -89,9 +89,9 @@ def new_name(name: str | None, title: str) -> str:
     return next(n for n in (base if i == 1 else f"{base}-{i}" for i in range(1, 10_000)) if not (DOCS / n).exists())
 
 
-def add_doc(*, title: str, kind: str, text: str, content: str | bytes, url: str | None = None, name: str | None = None) -> dict:
+def add_doc(*, title: str, kind: str, text: str, content: str | bytes, url: str | None = None) -> dict:
     with LOCK:
-        (p := DOCS / new_name(name, title)).mkdir()
+        (p := DOCS / new_name(None, title)).mkdir()
     set_files(p, kind, text, content)
     write(p / "annotations.json", [])
     host, now = urlparse(url).hostname if url else None, time.time()
