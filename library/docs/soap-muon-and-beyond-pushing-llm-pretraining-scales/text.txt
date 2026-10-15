@@ -1,0 +1,1197 @@
+2026-7-24
+SOAP, Muon, and Beyond: Pushing LLM
+Pretraining Scales
+Mikail Khona, Aditya Vavre, Boxiang Wang, Deyu Fu, Hao Wu, Mike Chrzanowski, Bryan
+Catanzaro, Dheevatsa Mudigere, Jeff Pool, Michael Lightstone, Mohammad Shoeybi, Mostofa
+Patwary, Nima Tajbakhsh, Tijmen Blankevoort
+NVIDIA
+{mkhona, avavre, boxiangw, deyuf, skyw, mchrzanowski, bcatanzaro, dmudigere, jpool, mlightstone, mshoeybi,
+mpatwary, ntajbakhsh, tblankevoort}@nvidia.com
+Higher-orderoptimizerssuchasMuonandSOAPofferfasterconvergencethanAdamW,buttheircomputational
+cost and numerical stability challenges have limited adoption at scale. In this work, we adapt and enhance
+preconditioned gradient methods to overcome the practical challenges of large-scale LLM pretraining.
+We first identify instabilities in SOAP at large batch sizes and propose algorithmic modifications including
+per-step QR orthogonalization and improved preconditioning strategies that eliminate loss spikes and enable
+stable training in these regimes. We then present a unified empirical study of SOAP, Muon, and AdamW
+using update-RMS matching to ensure fair learning rate transfer across optimizers. As part of this analysis,
+we empirically evaluate the orthogonalization quality of Muon. Our experiments on multi-billion-parameter
+models trained on trillions of tokens reveal that SOAP and Muon consistently outperform AdamW at the
+scales we tested. Notably, at batch sizes of up to 100M tokens for next-token prediction, these optimizers
+maintain training stability and quality while AdamW degrades.
+To enable efficient training at large scale, we introduce a layer-wise distributed optimizer compatible with
+Megatron-LM. Our implementation balances memory and hides communication while avoiding approximations
+to the optimizer computations, thus retaining their convergence benefits. Additionally, we identify and
+build specific system-level improvements to further accelerate our layer-wise implementation. To support the
+research community, we release a codebase that contains emerging algorithms for optimization:
+https://github.com/NVIDIA-NeMo/Emerging-Optimizers
+1. Introduction
+The choice of the optimization algorithm remains at the center of frontier model training frameworks.
+Indeed, it serves as the heart of all large-scale model training, linking systems engineering with
+algorithms and model convergence. From a systems perspective, the optimizer dictates the funda-
+mental constraints of distributed execution: optimizer states typically consume significantly more
+memory than the model parameters themselves, heavily influencing model sharding and memory
+management strategies. Further, an optimizer’s ability to maintain stability at extreme batch sizes
+dictates how far training can scale across large accelerator clusters without being bottlenecked by
+communication overhead due to the synchronous nature of training workloads. Algorithmically, the
+optimizer governs data efficiency, convergence rates, and the generalization ability of the model.
+Despite this dual impact, the evolution of optimization in deep learning has been defined by a
+practical tension: the computational simplicity and scalability of element-wise scalar optimizers,
+such as AdamW [1, 2], RMSProp [3], and LaProp [4], have largely overshadowed curvature-aware
+higher-order methods. While first-order methods like AdamW dominate due to their ease of use,
+they inherently treat individual parameter element updates independently, ignoring the correlational
+structure between gradients and the operator nature of the corresponding neural network weights.
+Conversely, higher-order optimizers (approximating second-order information) capture the geometry
+of the loss landscape [5,6,7], theoretically allowing for larger steps, faster convergence, and potentially
+higher accuracy, but suffer from a lack of scalability due to their complexity.
+©2026 NVIDIA. All rights reserved.
+arXiv:2607.20548v1  [cs.LG]  13 Jul 2026
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Recently, tensor-wise adaptive methods such as the Shampoo optimizer and modern variants like
+SOAP [8], Eigen-corrected Shampoo [9], and KL-Shampoo [10], along with spectral optimizers such
+as Muon and Scion [11], have emerged as a middle ground, offering the benefits of second-order
+methods with manageable computational and memory overhead. However, these methods face
+scalability hurdles when applied to large frontier models like fine-grained MoEs.
+The rest of this paper is organized around the formulation, empirical evaluation, and systems
+engineering required to scale these higher-order optimizers. Our core contributions are as follows:
+• Large Batch-Size Scaling for MoEs with Muon: We use an update-RMS matching
+framework to fairly transfer learning rates and compare AdamW, Muon, and SOAP optimizers.
+We motivate the MoE large-batch setting in Sec. 3 and present empirical results in Sec. 5.3 and
+Sec. 5.5. Our evaluation on up to 72-billion parameter MoE models demonstrates that while
+AdamW’s performance degrades beyond critical batch sizes, both Muon and SOAP maintain
+token-efficient convergence at global batch sizes up to 100M tokens.
+• Fixing Instability for SOAP’s Preconditioner Computation: We identify a critical
+instability in the standard implementation of SOAP1 unique to the large-batch regime, caused
+by a lag between the preconditioner and current gradient statistics. Sec. 5.4 shows that enforcing
+the per-step eigenbasis updates with current gradients and integrating a recently developed KL-
+divergence-based covariance estimation method for accumulating SOAP’s Kronecker factors [10]
+eliminates all training loss spikes and improves training stability, allowing for more confidence
+for scaling to larger batch and model sizes in production.
+• Comparing SOAP and Muon: We compare the accuracy and stability of these optimizers in
+the large batch setting, finding that both Muon and SOAP outperform AdamW and KL-SOAP
+has a slight edge over Muon. We also discuss the limitations of our conclusions.
+• Scalable Parallelization: We present an efficient, layer-wise distributed implementation
+designed to enable scalability within the Megatron-LM framework. We briefly discuss the
+distributed optimizer constraints in Sec. 3.3 and present the implementation in Sec. 6.
+•Emerging-Optimizers : We contribute an open-source library for optimizer research that
+includes implementations of all optimizers considered in this report as well as many experimental
+variants.
+2. A Primer on Adam, Muon and SOAP
+Adam-style optimizers are the most common optimizers used in modern LLM pretraining, which
+extend stochastic gradient descent (SGD) with coordinate-wise adaptive learning rates and decoupled
+weight decay [1, 2]. Here we provide a very brief overview of these methods and how they are related.
+Let 𝑔𝑡 ∈R 𝑑=𝑚𝑛 be the flattened gradient vector𝐺𝑡 ∈R 𝑚×𝑛 of a parameter tensor at step𝑡.
+AdamW maintains exponential moving averages (EMA) of the gradient and squared gradient for
+each parameter element independently with𝛽1,𝛽 2 being the EMA timescale coefficients.
+𝑚𝑡 =𝛽 1𝑚𝑡−1 + (1−𝛽 1)𝑔𝑡𝑣𝑡 =𝛽 2𝑣𝑡−1 + (1−𝛽 2)𝑔𝑡⊙𝑔𝑡
+where⊙ denotes the element-wise (Hadamard) product. The preconditioned update direction for
+AdamW (ignoring first-moment momentum𝑚𝑡 and bias corrections for simplicity) applies a diagonal
+preconditioner to the gradient:
+𝑢𝑡 =𝑚 𝑡∘diag
+(︂ 1
+(𝑣𝑡)1/2 +𝜖
+)︂
+1https://github.com/nikhilvyas/SOAP
+2
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+This element-wise structure makes AdamW memory-regular, and easy to shard in large distributed
+systems. However, it also means that AdamW ignores the matrix or tensor structure of neural
+network weights: each coordinate is rescaled separately, but correlations across rows, columns, heads,
+experts, or projection subspaces are not modeled explicitly.
+A separate line of optimizers attempts to exploit this structure through preconditioning. Shampoo [12]
+approximates second-order information by maintaining Kronecker-factored gradient statistics for each
+tensor dimension, allowing matrix- or tensor-shaped parameters to be updated using curvature-aware
+transformations without forming a full dense preconditioner. Shampoo maintains two separate
+symmetric covariance matrices for the rows and columns:
+𝐿𝑡 =𝛽 2𝐿𝑡−1 + (1−𝛽 2)𝐺𝑡𝐺⊤
+𝑡
+𝑅𝑡 =𝛽 2𝑅𝑡−1 + (1−𝛽 2)𝐺⊤
+𝑡 𝐺𝑡
+Shampoo’s update direction is then produced through a non-diagonal kronecker-factored precondi-
+tioner, derived from inverse powers of the kronecker factors:
+𝑢𝑡 = (𝑅−1/4
+𝑡 ⊗𝐿−1/4
+𝑡 )𝑔𝑡
+SOAP (Alg.2) builds on Shampoo by combining Shampoo-style preconditioning with Adam-like
+elementwise adaptive updates in the preconditioner eigenbasis [8]:
+𝑢𝑡 =𝑄 𝐿Adam(𝑄𝑇
+𝐿𝑚𝑡𝑄𝑅)𝑄𝑇
+𝑅 (1)
+Intuitively, SOAP first rotates gradients into a basis where their row and column correlations are
+approximately diagonalized (i.e. the eigenbasis of𝑅𝑡 and 𝐿𝑡), applies an adaptive element-wise
+update in that basis, and then rotates the update back out of the preconditioner eigenbasis. This gives
+SOAP a closer connection to AdamW than classical Shampoo, since for identity-valued eigenvectors,
+we exactly recover AdamW, while retaining the ability to exploit structure within weight matrices,
+possibly allowing for smoother hyperparameter transfer. However both Shampoo and SOAP maintain
+full precision preconditioner and kronecker factor matrices requiring significantly more memory than
+AdamW.
+Muon (Alg.1) skips computing and storing preconditioners and follows a different strategy. Rather
+than estimating preconditioners and full adaptive second-moment statistics in a preconditioned
+basis, Muon applies momentum like AdamW and Shampoo, Eq.2, and then orthogonalizes it.
+To orthogonalize𝑀𝑡 and approximate its polar factor (the closest orthogonal matrix, equivalent
+to 𝑈𝑉⊤ from the singular value decomposition𝑀𝑡 = 𝑈Σ𝑉⊤), Muon employs Newton-Schulz
+iterations [11, 13, 14, 15, 16] which use matrix polynomial iteration to approximately compute the
+polar factor.
+This can be viewed as a spectral update, since for 2D weight matrices, Muon changes the direction
+of the update so that its singular values are controlled, rather than applying independent coordinate-
+wise rescaling like AdamW. In simplified terms, SOAP/Shampoo-style whitening and Muon-style
+orthogonalization are closely related: both reduce the dominance of large singular directions and
+produce updates that better respect the operator structure of linear layers. Notably, turning off
+EMA by setting𝛽1,𝛽 2 = 0in Shampoo mathematically reduces its preconditioned update directly
+to the polar factor𝑈𝑉⊤, since( GGT)−1/4 G( GTG)−1/4 = 𝑈𝑉⊤, recovering the Muon update.
+See Appendix A.1 for a detailed SVD interpretation of SOAP’s preconditioning and the intuitive
+relationships between all three optimizers.
+There are practical differences between using these optimizers at scale. Here we summarize the
+qualitative differences. AdamW is the easiest optimizer to scale because its state and computation
+3
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+are element-wise and hence infinitely shardable. SOAP is more expressive, but it must maintain
+and update Kronecker factors and eigenbases, making it more sensitive to numerical stability,
+preconditioner freshness, has a much larger memory footprint, and complicated matrix-based
+distributed tensor layout for sharding. Muon has a lower footprint than AdamW since it does
+not maintain second moments but it still requires full 2D matrix updates which faces the same
+matrix-based sharding issues as SOAP. Muon uses more computation in the optimizer step and
+this overhead depends on the quality and cost of orthogonalization which scales with number of
+Newton-Schulz iterations.
+3. A Primer on Optimization for Large Scale, Large Batch Pretraining
+3.1. Batch Size Scaling for Mixture-of-Experts Models
+Large-batch scaling is particularly nuanced for Mixture-of-Experts (MoE) models because the
+majority of the model’s parameters reside in the expert linear layers (often> 90%of the total
+parameter count). Unlike dense models, these layers observe a significantly lowereffectivebatch
+size due to sparse top-k routing. Consider a global batch size of𝐵Global tokens trained with a top-𝑘
+routing strategy over𝑁 total experts. Assuming an ideally load-balanced router, the effective batch
+size𝐵 expert
+eff seen by any single expert is given by:
+𝐵expert
+eff =𝐵 Global× 𝑘
+𝑁 (2)
+Since 𝑘≪𝑁 in typical fine-grained sparse MoE configurations (e.g., top-8 gating with 256 experts
+[17], leading to𝐵expert
+eff /𝐵Global = 0.03125), each expert sees only a small fraction of the global batch.
+Consequently, when scaling to very large global batch sizes, the sparse expert parameters remain in
+a lower-effective-batch regime that is generally easier to optimize. In contrast, the dense and shared
+parameters must process the full global batch. As a result, increasing the global batch size primarily
+stresses the large-batch tolerance of the dense components. This makes MoE training highly reliant
+on optimization methods that can maintain stability and token efficiency specifically for these dense
+parameters operating at extreme batch sizes [18].
+3.2. Batch Size–Learning Rate Scaling and Update Variance
+Because our comparisons change global batch size by up to 4x, we need a learning-rate transfer rule
+that keeps update scale comparable before attributing differences to the optimizer itself. In the
+context of SGD, modifying the mini-batch size requires a corresponding adjustment to the learning
+rate to maintain stable and transferrable optimization dynamics. Let us consider a simple SGD
+update where the gradient estimator^𝑔𝐵, computed over a mini-batch of size𝐵, is given by:
+^𝑔𝐵 = 1
+𝐵
+𝐵∑︁
+𝑖=1
+∇𝐿𝑖(𝜃)
+The parameter update is defined asΔ𝜃 =𝜂^𝑔𝐵, where𝜂 represents the learning rate. Assuming the
+individual sample gradients are independent, the covariance of the gradient estimator scales inversely
+with the batch size:
+Cov(^𝑔𝐵) = 1
+𝐵 Σ
+whereΣis the covariance matrix of the per-sample gradients. Consequently, the covariance of the
+parameter update itself is:
+Cov(Δ𝜃) =𝜂 2 1
+𝐵 Σ
+4
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+When scaling the batch size from an initial size𝐵 to a target size𝐵′, a heuristic approach is to
+preserve the variance scale of the parameter updates. We equate the covariances of the updates
+under both batch size regimes:
+𝜂2
+𝐵 Σ = (𝜂′)2
+𝐵′ Σ
+Solving for the updated learning rate𝜂′ yields the Square Root Scaling Rule:
+𝜂′ =𝜂
+√︃
+𝐵′
+𝐵 (3)
+To ensure that the scale of the random fluctuations in parameter updates (Δ𝜃) remains similar when
+we switch from batch size𝐵 to 𝐵′, we adjust the learning rate by the square root of the ratio of the
+batch sizes. The logic behind this rule is focused on noise or variance preservation. Although the
+linear scaling rule [19] has also been proposed, square-root scaling is safer when making very large
+leaps in batch size, as it prevents the learning rate from exploding. Several more rigorous treatments
+of this rule have been developed, such as in [20].
+3.3. Strategies for Enabling Distributed Training with Preconditioning
+The gains from large batch training properties of Muon and SOAP can only be realized if the training
+system can preserve full matrix structure under tensor parallelism without additional exposed
+communication. When tensor parallelism is applied, the weights of a linear layer are distributed
+across multiple GPUs. Beyond the simplest method of preconditioning based solely on the weights
+owned by a given GPU, commonly referred to as “blocking”,Emerging-Optimizers also supports
+two distinct approaches for preconditioning on the entire layer’s weights:
+• Duplicated: The weights are initially all-gathered to all GPUs within the Tensor Parallelism
+(TP) domain. Subsequently, each GPU independently executes the Newton-Schulz iteration.
+This mode is preferable for smaller layers where communication is the limiting factor.
+• Distributed: In each Newton-Schulz iteration, the intermediate results of the first matrix
+multiplication are all-reduced. This mode is preferable for larger layers where computation is
+the limiting factor.
+In both the “duplicated” and “distributed” modes, the inputs are first normalized using the statistics
+of the entire layer’s weight, thereby ensuring mathematical equivalence to the scenario without
+tensor parallelism.
+Conventional distributed optimizer sharding approaches (like ZeRO-1 [21, 22]) are not directly
+appropriate for matrix-based optimizers like Muon and SOAP. If weights and optimizer states are
+evenly distributed among DP ranks, updates cannot be calculated based on the shard available on
+each rank. Additional communication is needed to collect tensors for calculating the full update.
+To overcome this, we developed a layer-wise distributed optimizer, in which parameters of different
+layers are distributed to different DP ranks. Each GPU has full layers’ worth of parameters so that
+the preconditioner can be calculated2.
+2https://docs.nvidia.com/nemo/emerging-optimizers/latest/primer/layerwise-distributed-optimizer.
+html
+5
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+4. Background and Related Work
+4.1. Shampoo and related optimizers
+Shampoo [12] is an optimization algorithm that bridges the gap between first-order methods like
+Adam and full-matrix methods like Natural Gradient Descent and Adagrad. At its core, Shampoo
+maintains a running estimate of the all-dimensional correlations of the parameter gradients, but
+it does so efficiently by using a Kronecker-factored approximation of the Fisher information or
+the empirical covariance matrix. By treating gradients as tensors rather than flattened vectors, it
+preserves the spatial or structural correlations inherent in neural network layers. Building upon this
+foundational work, [23] develops techniques to scale Shampoo to larger models, including “blocking"
+or restricting preconditioning to subsets of matrices and coupled iterations [23, 24] for root-inverse
+computation that avoid eigensolvers. These optimizations effectively mitigate the memory and
+computational bottlenecks traditionally associated with Kronecker-factored second-order methods.
+By amortizing the cost of the preconditioner update across multiple steps and leveraging hardware-
+accelerated matrix operations, these variants achieve a convergence rate superior to first-order
+optimizers like Adam, while maintaining a comparable per-step wall-clock time.
+Modern variants of Shampoo have been proposed, such as Eigen-decomposed Shampoo [9], KL-
+Shampoo [10], SOAP [8], and DASH [24]. These algorithms improve the estimation of Shampoo’s
+preconditioner and thus improve convergence and stability.
+Spectral descent was first developed in [25, 26, 27, 28], and a rigorous framework for spectral descent
+for all layer types in deep learning was established in [11]. In another line of work, Bernsteinet al.
+[29, 30, 31] have shown that steepest descent under different norm constraints on parameters provides
+a picture that unifies element-wise optimizers such as AdamW and matrix-based optimizers such as
+Muon. Several variations of Muon have recently been developed, such as Muon+ [32], Muon++ [33],
+AdaMuon [34], NorMuon [35], Muon-Hyperball [36], Muon on the spectral sphere [37], NAMO [38],
+SPEL [39], Newton-Muon [40], and Mousse [41].
+4.2. Systems to enable higher-order optimizers
+Conventional Fully Sharded Data Parallel (FSDP) systems restrict tensors to symmetric element-
+wise shards. While this is highly effective for standard element-wise optimizers like AdamW, it
+fundamentally conflicts with higher-order, structure-aware optimizers. These optimizers often
+require access to full 2D parameter matrices (e.g., for computing Muon’s Newton-Schulz matrix-sign
+polynomial iteration) or specific contiguous blocks. To address this, veScale-FSDP [42] introduces
+RaggedShard, a flexible sharding format that supports asymmetric and arbitrary data granularities.
+This enables an execution pipeline where full parameters can be dynamically gathered to a root device
+for complex local computations, and the resulting updates asynchronously scattered back. To support
+this flexibility without sacrificing scale, veScale-FSDP pairsRaggedShard with a structure-aware
+planning algorithm and a zero-copy distributed buffer, minimizing both communication overhead
+and memory fragmentation. Canzona [43] builds an asynchronous framework that decouples the
+logical assignment of optimizer states from the physical distribution of model parameters. For Data
+Parallelism (DP), it employs a static partitioning strategy that maintains matrix atomicity for
+the optimizer while preventing load imbalance. For Tensor Parallelism (TP), Canzona utilizes an
+asynchronous pipeline with micro-group scheduling to batch fragmented updates and hide matrix
+reconstruction overheads. This approach masks the communication costs of higher-order optimizers,
+reducing the latency of each step while preserving the throughput of established parallel architectures.
+6
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+5. Pretraining Experiments with Muon and SOAP
+Next, we describe our setup and follow up with experiments with Muon, SOAP and experiments
+comparing Muon and SOAP in the large batch regime on dense and MoE models.
+5.1. Model and Dataset
+Model ArchitectureWe run all of our optimizer experiments on 8B dense GPT models [44]
+and 3B active/30B transformer-only MoEs [45], and finally scale up to 8B active/72B hybrid
+Mamba-Transformer MoEs [46].
+DatasetWe use 1T- and 3T-token subsets of the full Nemotron-3 dataset [46].
+Architecture ConfigurationsThe core architectural hyperparameters for our dense and sparse
+models are detailed in Table 1. For the attention mechanism, all models utilize a head dimension of
+128 and Grouped-Query Attention (GQA) to improve inference efficiency.
+Model Hidden Size Layers GQA FFN / Expert Size
+Nemotron-3-Nano-30B-A3B 2688 52 2 1856
+8B Dense Transformer 4096 32 8 21504
+Nemotron-3-72B-A8B 4096 52 8 2688
+Qwen3-30B-A3B 2048 48 4 768
+Table 1| Core architectural hyperparameters for the evaluated models. For MoE models, the FFN
+size denotes the hidden size of an individual expert. All models use 32 heads with head dimension
+128.
+Model Total Experts Active Experts (Top-𝑘) Shared Expert Size
+Nemotron-3-Nano-30B-A3B 128 6 3712
+Nemotron-3-72B-A8B 512 6 5376
+Qwen3-30B-A3B 128 8 N/A
+Table 2|MoE and routing configurations for the Mixture of Experts (MoE) models.
+Mixture of Experts (MoE) ConfigurationFor our sparse models, we employ a load-balancing
+strategyutilizingasigmoidscorefunctioncombinedwithsequence-levelauxiliaryloss( seq_aux_loss).
+Byapplyinganauxiliarylosscoefficientof1 ×10−4, weeffectivelymitigateroutingcollapse—penalizing
+unbalanced token assignments and ensuring that active experts receive a relatively uniform distribu-
+tion of tokens across the sequence. Our MoE variants also leverage shared experts with overlapping
+computation. For instance, the 8B Hybrid MoE scales up to 512 total experts with a top-6 routing
+sparsity granularity and an additional shared expert intermediate size of 5376.
+Optimization and Learning Rate ScheduleTo train our models, the baselines use a standard-
+ized global batch size of 3072 samples, with a sequence length of 8192 tokens each (leading to a
+global batch size of 25M tokens) across all architectures. We apply a uniform weight decay of 0.1.
+7
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Model Max LR Min LR
+Nemotron-3-Nano-30B-A3B1.0×10 −3 1.0×10 −5
+8B Dense GPT8.0×10 −4 8.0×10 −6
+Nemotron-3-72B-A8B8.0×10 −4 8.0×10 −6
+Qwen3-30B-A3B1.6×10 −3 1.6×10 −5
+Table 3| Learning rate schedules for the evaluated models. All models utilize a global batch size of
+3072 (micro-batch size of 1), a constant weight decay of 0.1, and a Warmup-Stable-Decay (WSD)
+schedule with a minus-square-root (minus_sqrt) decay style.
+For learning rate progression, we adopt a Warmup-Stable-Decay (WSD) scheduling strategy [47].
+Following a linear warmup phase, the learning rate is held constant during the stable phase before
+transitioning into an annealing phase. Specifically, we utilize a minus-square-root (minus_sqrt)
+decay style for the final WSD decay.
+5.2. Optimizer Comparison Protocol
+A critical challenge in comparing optimizers is ensuring a fair hyperparameter configuration. To
+address this, we utilize anupdate RMS matchingframework pioneered by Kimi-Moonshot [13].
+This technique allows us to transfer learning rates (LRs) effectively between optimizers by ensuring
+the root mean square (RMS) norm of the parameter updates is consistent across methods, reducing
+tuning compute.
+Under this RMS-matching framework, SOAP and AdamW naturally have identical update RMS
+norm since rotation matrices do not change norm:
+‖ΔW‖2
+𝐹 =Tr
+(︁
+ΔW𝑇ΔW
+)︁
+=Tr
+(︁
+(Q𝐿NQ𝑇
+𝑅)𝑇 (Q𝐿NQ𝑇
+𝑅)
+)︁
+=Tr
+(︁
+(Q𝑇
+𝑅Q𝑅)N𝑇 (Q𝑇
+𝐿Q𝐿)N
+)︁
+SinceQ 𝐿 andQ 𝑅 are orthonormal,
+Q𝑇
+𝐿Q𝐿 =I,Q 𝑇
+𝑅Q𝑅 =I,
+‖ΔW‖2
+𝐹 =‖N‖ 2
+𝐹
+We explicitly apply Kimi’s update RMS matching framework to Muon (Algorithm 1), which gives us
+a correction factor that depends on the EMA damping factor of momentum [48, 49, 50]:
+√︃
+1−𝛽 1
+1 +𝛽 1
+≈0.2
+Notably, we observed that using Nesterov momentum [51, 52] did not improve convergence and
+skipped using it for both Muon and SOAP, and using simple exponential moving averages (EMA)
+for momentum.
+5.3. Muon Scales Better than AdamW at Large Batch Sizes for Pretraining
+Prior research indicates that Muon and its variants significantly outperform AdamW as the global
+batch size scales [11]. While AdamW often hits a "critical batch size" [53] beyond which increasing
+8
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+parallelism yields diminishing returns, token inefficiency, or instability, Muon’s orthogonalization
+and spectral descent allow it to maintain convergence at much larger batch sizes.
+Our experiments confirm that Muon provides better stability and lower loss compared to AdamW in
+this setting. At a baseline (1×) batch size, Muon achieves lower training loss and exhibits fewer
+spikes, Fig.1. We have empirically found training loss to correlate to held-out validation loss on our
+dataset and we include evaluation on downstream tasks for a subset of models in Table 5. Crucially,
+as we scale the global batch size, AdamW fails to scale effectively, rapidly encountering instabilities
+and diminishing returns. In contrast, Muon maintains robust convergence characteristics, effectively
+utilizing the increased data parallelism to speed up training.
+Algorithm 1Muon:MomentUmOrthogonalized byNewton-Schulz with Weight Decay
+1:Hyperparameters:𝜂 𝑡, 𝛽1, 𝜆𝑡, 𝑛,{(𝑎𝑖,𝑏𝑖,𝑐𝑖)}𝑛
+𝑖=1, 𝜖
+2:Optimizer States:M 𝑡∈R in×out (Momentum buffer)
+3:G 𝑡 =∇ W𝐿(W𝑡−1)
+Update Momentum Buffer with EMA:
+4:M 𝑡←𝛽 1M𝑡−1 + (1−𝛽 1)G𝑡
+Newton-Schulz Orthogonalization:
+5:X 0←M 𝑡/max(‖M𝑡‖𝐹,𝜖)◁Initialize with normalized momentum
+6:for𝑖= 1to𝑛do
+7:A←X 𝑖−1X𝑇
+𝑖−1
+8:B←𝑏 𝑖A+𝑐 𝑖A2
+9:X 𝑖←𝑎 𝑖X𝑖−1 +BX𝑖−1
+10:end for
+11:O 𝑡←X 𝑛 ◁Resulting orthogonalized update direction
+Post-processing update direction normalization:
+12:ΔW←O 𝑡·
+√︀
+max(in,out)◁Kimi scaling for update RMS matching
+Decoupled weight decay and parameter update:
+13:W 𝑡←(1−𝜂 𝑡𝜆𝑡)W𝑡−1−𝜂𝑡ΔW
+Hyperparameter Description Value
+𝛽1 Momentum EMA coefficient 0.9
+𝜆𝑡 Decoupled weight decay coefficient 0.1
+𝑛Number of Newton-Schulz iterations 16
+{(𝑎𝑖,𝑏 𝑖,𝑐 𝑖)}𝑛
+𝑖=1 Newton-Schulz polynomial coefficients PolarExpress [15]
+𝜖Lower bound for the Frobenius-norm normalization10 −7
+Table 4|Muon hyperparameters used in Algorithm 1.
+We hypothesize that at extreme batch sizes, the gradient noise decreases, which can cause AdamW’s
+element-wisesecond-momentestimator(v 𝑡)tobecomepoorlycalibratedoroverlyconfident, leadingto
+suboptimal step sizes. In contrast to AdamW, Muon’s spectral preconditioning (i.e. orthogonalization
+of the momentum matrix) structurally normalizes the update directionsindependentof coordinate-
+wise scaling, making it resilient to the variance fluctuations of large-batch scaling.
+We also find in Fig. 2 that implementing abatch size ramp-upphase early in training allows Muon
+to significantly outperform AdamW on both final training loss and downstream evaluation metrics,
+while using a larger batch size for the majority of training. We note that the rampup schedule was
+used only with the larger batch pretraining experiments for both optimizers. Following [54], we
+adopt a ramp-up schedule governed by a few simple rules. We treat the language modeling loss as
+9
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Figure 1| Loss curves of Muon at large batches (2x and 3x) with NVIDIA-Nemotron-Nano-V3-30B-
+A3B on a 3T-token horizon compared against the original AdamW baseline of [46]. The inset shows
+the relative loss gaps as a function of tokens against the AdamW baseline. Larger batches typically
+underperform and eventually exceed lower batch sizes, especially as the token horizon scales.
+Figure 2| Hybrid Mamba-MoE 72B-A8B trained on 1T tokens with Muon at 2x the batch size of
+the AdamW baseline (25M tokens). Inset shows that Muon at larger batches haslowerloss and no
+loss spikes relative to the smaller batch AdamW baseline.
+10
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+the signal dictating the optimal batch size. Starting from a batch size of 256 samples (2M tokens),
+we double every𝑆 steps over a fixed ramp-up horizon of𝑁 total steps, irrespective of the token
+horizon, until the target batch size is reached, Fig. 3. The learning rate warmup is tied directly to
+the batch size ramp-up to approximately maintain the square-root scaling ratio throughout, i.e.,
+𝜂∝
+√
+𝐵, as motivated by large-batch training theory [55, 56, 57, 58]. Specifically, the learning rate
+at each stage is tuned to preserve the variance scale of the parameter update as the batch size
+changes. We note that we did not tune the batch size ramp-up schedule as a function of model scale
+[54, 53], where the critical batch size typically depends on the training loss; hence, larger models are
+expected to reach higher critical batch sizes earlier than smaller models.
+We evaluate on two architectures: NVIDIA-Nemotron-Nano-V3, a hybrid attention-mamba MoE
+model with 30B total and 3B active parameters trained on 3T tokens, and a hybrid LatentMoE
+model with Multi-Token Prediction (MTP) layers [59, 17] with 72B total and 8B active parameters
+trained on a 1T token horizon. Table 5 reports downstream evaluation results for these models.
+For both architectures, Muon consistently matches or outperforms AdamW at baseline batch size
+and continues to improve as batch size scales, whereas AdamW does not (Fig. 10). The gains are
+most pronounced in coding and commonsense reasoning. We also note that while ablating the
+hybrid Mamba-MoE architecture of Table 5, we found an important architectural sensitivity: Muon
+is best applied selectively to dense linear projections, as we found that falling back to AdamW
+for Mamba’s conv1D weights [60] yields better convergence. These results validate that Muon’s
+large-batch efficiency transfers to MoE architectures up to the≈5𝑒22 pretraining FLOPs scale.
+We further validate that these results hold with MXFP8 pretraining in Appendix Sec. B.
+Figure 3| The batch size ramp-up schedules (in blue) used in pretraining experiments for final batch
+sizes of 50M and 75M tokens (in red).
+5.4. Training Stability with SOAP
+We observed significant empirical hurdles when scaling SOAP to large-batch, large parameter count
+regimes. Here we document the instability with SOAP before moving on to experiments that compare
+them.
+5.4.1. Diagnosing the "Slingshot" Instability
+The reference SOAP implementation3 mitigates the computational expense of QR decomposition
+by refreshing the eigenbasis infrequently (e.g., every 10 steps) but also simultaneously omits the
+3https://github.com/nikhilvyas/SOAP
+11
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Metric NVIDIA-Nemotron-Nano-V3 8B Hybrid MTP
+Muon 3×Muon 2×Muon 1×AdamW 1×Muon 2×AdamW 1×
+MMLU
+MMLU 74.0074.8073.71 73.3874.8974.59
+MMLU PRO CoT 55.61 56.7758.1954.4559.6057.52
+Coding
+HumanEval 62.2264.7962.56 63.2665.7957.62
+HumanEval+ 59.1862.1359.63 58.6361.8656.40
+MBPP 68.1569.9268.91 67.6170.9966.79
+MBPP+ 58.02 57.94 57.8059.3655.26 55.07
+Coding Avg. 61.89 63.70 62.23 62.22 63.48 58.97
+Math
+Math 500 73.25 74.0575.5071.50 75.6080.20
+GSM8k CoT89.6989.08 89.54 87.79 85.9787.87
+Math Avg. 81.47 81.57 82.52 79.65 80.79 84.04
+Commonsense Reasoning
+Race85.8485.55 85.45 85.1786.3285.26
+ARC Challenge 89.1689.5088.05 88.4089.1689.09
+Winogrande 74.19 72.6974.5172.9375.3773.95
+Hellaswag 81.23 81.3981.5181.0682.3782.33
+Commonsense Avg. 82.61 82.28 82.38 81.89 83.31 82.66
+Table 5| Benchmark results across MMLU, Coding, Math, and Commonsense Reasoning for Muon
+and AdamW optimizers at varying batch sizes (𝑛×GBS) for the Nano-V3 and 8B Hybrid MTP
+models. 1×GBS is equivalent to 25xM tokens per batch.
+current step’s gradient from the eigenbasis recalculation. While harmless for smaller models and
+higher eigenbasis recomputation intervals, our large-batch pretraining experiments reveal that this
+configuration induces severe early-training instability. As illustrated in Fig. 4, this manifests as
+oscillating weight gradient norms followed closely by spikes in the language modeling loss.
+We attribute this to a "stale preconditioner" effect. Because the loss landscape changes rapidly
+during the early phases of large-batch training, applying a preconditioning matrix derived from
+outdated gradient statistics causes the optimization trajectory to "slingshot". For the smaller 621M
+model, these oscillations are eventually damped, and the model converges, Fig. 4. However, as we
+scale up to an 8B dense model, this lag becomes catastrophic, leading to training divergence and
+significantly poorer quality compared to AdamW, Fig. 5.
+12
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Algorithm 2KL-SOAP used in experiments, based on [8, 10]
+1:Hyperparameters:𝛽 kron, 𝛽1, 𝛽2, 𝑝, 𝜂𝑡, 𝜖, 𝐹, 𝜆𝑡
+2:Optimizer States:m 𝑡,v 𝑡∈R in×out;L 𝑡,Q L∈R in×in;R 𝑡,Q R∈R out×out
+3:G 𝑡 =∇ W𝐿(W𝑡−1)
+Accumulate Kronecker Factors (KL-Shampoo):
+4:𝜆 𝐿 =diag(Q 𝑇
+𝐿L𝑡−1Q𝐿)◁Approximate eigenvalues
+5:𝜆 𝑅 =diag(Q 𝑇
+𝑅R𝑡−1Q𝑅)
+6:L 𝑡←(1−𝛽 kron)L𝑡−1 + 𝛽kron
+out G𝑡 (𝜆𝑅 +𝜖)−𝑝 G𝑇
+𝑡
+7:R 𝑡←(1−𝛽 kron)R𝑡−1 + 𝛽kron
+in G𝑇
+𝑡 (𝜆𝐿 +𝜖)−𝑝 G𝑡
+Eigenbasis Re-computation
+8:if𝑡mod𝐹= 0then
+9: ^m𝑡 =Q 𝐿 m𝑡 Q𝑇
+𝑅
+10:Q 𝐿 =QR(L𝑡 Q𝐿).𝑄
+11:Q 𝑅 =QR(R𝑡 Q𝑅).𝑄
+12:m 𝑡 =Q 𝑇
+𝐿 ^m𝑡 Q𝑅
+13:end if
+Rotate gradient into eigenbasis
+14:G ′
+𝑡← ^Q𝑇
+𝐿 G𝑡 ^Q𝑅
+Calculate Adam update
+15:m 𝑡←(1−𝛽 1)m𝑡−1 +𝛽 1 G′
+16:v 𝑡←(1−𝛽 2)v𝑡−1 +𝛽 2 G′
+𝑡⊙G′
+𝑡
+17:N← m𝑡√v𝑡 +𝜖
+Rotate update out of eigenbasis
+18:ΔW=Q 𝐿 N Q𝑇
+𝑅
+Weight decay and update
+19:W 𝑡←(1−𝜂 𝑡𝜆𝑡)W𝑡−1−𝜂𝑡ΔW
+Hyperparameter Description Value
+𝛽kron EMA coefficient for accumulating Kronecker factors 0.95
+𝛽1 First-moment EMA coefficient in the rotated basis 0.9
+𝛽2 Second-moment EMA coefficient in the rotated basis 0.95
+𝑝Exponent used in the KL-Shampoo covariance update -1
+𝐹Eigenbasis recomputation frequency 1
+𝜆𝑡 Decoupled weight decay coefficient 0.1
+𝜖Numerical stability constant for KL-covariance and Adam updates10 −8
+Table 6|KL-SOAP hyperparameters used in Algorithm 2.
+5.4.2. Mitigating Staleness: Real-Time Eigenbasis Updates
+We find that simply increasing the eigenbasis update frequency to every step is insufficient if the
+current iteration’s gradient is excluded. It is the combination of per-step QR updatesandthe
+inclusion of the current step’s gradient in the eigenbasis calculation that fully resolves the issue.
+When modified to use real-time gradient statistics, SOAP eliminates the loss spikes and achieves an
+LM loss on par with Muon, Fig. 7. We note that this implementation was present with SOAP and is
+not present in [23, 10] and other works.
+13
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Figure 4| SOAP with a preconditioner that is computed based on stale gradient statistics leads to
+an oscillatory instability of loss spikes preceded by gradient spikes. The experiment was performed
+on a dense 621M pure transformer model pretrained with a global batch size of 12.5M tokens.
+5.4.3. Gradient Covariance Estimation via Kullback–Leibler Minimization
+Even with real-time updates, the accumulation of Kronecker factor matrices (𝐺𝐺𝑇 and 𝐺𝑇𝐺)
+can suffer from instabilities at scale. As described in [10], we find that replacing the standard
+accumulation with the KL divergence-regularized covariance estimation algorithm provides a critical
+secondary layer of stability. As shown in Fig. 6, integrating KL-Shampoo’s update rule further
+suppresses loss spikes and yields a lower final training loss on the Qwen-3-30B-A3B architecture.
+This empirical improvement comes from better estimation of the gradient covariance, and the stability
+benefit comes from the spectral properties of the update. As detailed in Appendix A.3, KL-Shampoo
+reduces the condition number of the Kronecker factor matrices to the square root of the standard
+formulation:
+𝜅(SKL-Shampoo) =
+√︁
+𝜅(SShampoo).(4)
+We hypothesize that this property improves the numerical stability of the eigenbasis recomputation,
+whether using QR or eigendecomposition-based eigensolvers, safeguarding the training dynamics
+against floating-point noise and preventing subsequent gradient explosions or loss spikes.
+5.5. Comparing Muon and SOAP
+To evaluate the relative performance of Muon and SOAP, we use a controlled comparison. In both
+configurations, we employ the simplest "blocking" method for tensor parallelism support. Further, to
+ensure an apples-to-apples structural comparison, we disable Query-Key-Value (QKV) splitting in
+Muon. By treating the fused QKV projection as a single matrix, matching the default operational
+mode of our implementation of SOAP, we isolate the algorithmic differences in preconditioning and
+orthogonalization from structural choices.
+We do a comparative analysis for MoEs using the Qwen-3-30B-A3B architecture. Fig. 7 shows
+14
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Figure 5| The instability of Fig. 4 at a larger model size leads to training divergence in SOAP
+(blue) and large loss gaps relative to a baseline that uses current gradient statistics to compute
+preconditioners (in orange).
+15
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Figure 6|The inclusion of KL-divergence-based gradient covariance estimation [10] in SOAP stabilizes
+training and results in lower training loss and fewer loss spikes. Experiments were performed on a
+Qwen-3-30B-A3B architecture.
+the results of a large batch study comparing Muon and SOAP. We also include a version of Muon
+we term Momentum Orthogonalized by Polar (MOP), which is Muon that replaces Newton-Schulz
+orthogonalization with exact polar decomposition via SVD4. Fig. 8 presents the training trajectories
+for these optimizers under the same controlled tensor parallelism and non-split QKV conditions.
+Throughout the majority of the pretraining run, KL-SOAP maintains a consistent, albeit slight,
+edge over Muon in the CE loss.
+Tuning the "Epsilon"Both SOAP and Muon expose an𝜖 hyperparameter, and recent work has
+shown that this seemingly small numerical constant can affect optimizer stability, transfer across scale,
+and the predictability of training dynamics [61, 62, 63, 64]. In SOAP,𝜖 plays a role analogous to the
+𝜖 term in AdamW: it floors the denominator of the second-moment estimate after the momentum has
+been rotated into the preconditioned eigenbasis and the eigenvalues in the KL-Shampoo accumulation
+step. In addition, because SOAP uses Shampoo-style kronecker factors where the preconditioning
+is effectively applying inverse square powers to the kronecker factor eigenvalues [8], the𝜖 used for
+the Adam-like computation in the preconditioner basis can be interpreted as setting a soft floor
+on smallest effective eigenvalue of the Shampoo preconditioner. In Muon,𝜖 has a different role
+and is used directly in the normalization step before Newton-Schulz orthogonalization, where the
+momentum matrix is scaled bymax(‖M𝑡‖𝐹,𝜖 ). Thus, Muon’s𝜖 lower-bounds the Frobenius norm
+used for matrix normalization rather than flooring an element-wise second-moment estimate. We
+therefore treat𝜖 as an optimizer-specific hyperparameter: for SOAP it controls the numerical floor
+in preconditioned adaptive moments and factor inversions, while for Muon it controls the smallest
+normalization scale entering the Newton-Schulz iteration.
+Limitations of our workIn this report, we do not tune 𝜖 systematically. We use𝜖 = 10−8
+for SOAP and AdamW, and𝜖 = 10−7 for Muon. Understanding how these values should scale
+with model size, optimizer parameterization, precision format, and training horizon is an important
+direction for subsequent work.
+4This was first developed inhttps://github.com/KellerJordan/cifar10-airbench/tree/master
+16
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Figure 7| Large-batch comparative study of Muon and SOAP for the Qwen3-30B-A3B architecture
+(Top: 1x, Middle: 2x, Bottom: 4x GBS). Inset shows relative loss differences. Note that these
+experiments did not use any batch-size ramp-up.
+17
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Figure 8| Qwen-3-30B-A3B architecture pretrained with Muon, SOAP, and MOP with update-RMS
+matching. Both SOAP and MOP have slightly lower losses than Muon. Inset shows relative loss
+differences to the Muon baseline. The global batch size was fixed to 24M tokens for this experiment.
+6. Implementation Details: Layer-Wise Distributed Optimizer
+While higher-order optimizers like SOAP and Muon demonstrate better convergence and stability
+at larger batch sizes, realizing their empirical benefits in production environments requires the
+underlying training system to supply the optimizers with unfragmented 2D weight matrices without
+incurring too much exposed communication overhead. This conflicts with the tensor sharding
+inherent to standard distributed training approaches (e.g., ZeRO[22] or FSDP[21]). To overcome
+this system bottleneck, we developed a strategy native to the Megatron-LM framework [65].
+This implementation outlines a distributed optimizer strategy designed to support matrix-based
+optimizers by keeping parameter matrices fully intact, while still balancing memory and hiding
+communication bottlenecks. Here we describe the main features of the implementation, which is
+available in Megatron-LM5.
+1. Load Balancing: Instead of flattening and slicing individual tensors, entire parameter matrices
+are sorted by size and distributed across GPUs in a round robin sequence. This ensures every
+GPU has a roughly equal memory load without fragmenting the matrices.
+2. Parameter Update: Each GPU acts independently to update only its assigned parameters.
+It applies the optimizer math (e.g., using Muon or SOAP for 2D matrices and AdamW for
+standard vectors) to its specific layers, and then flattens the results into a buffer to be gathered
+in the next step’s forward pass.
+3. Overlapped Parameter All-Gather: Parameter synchronization is chunked into sequential com-
+munication buckets that logically align with the model’s execution order (leveraging Megatron’s
+DDP bucket infrastructure). By grouping layers into these buckets, the system bounds message
+sizes and enables pipelining. Instead of a single, monolithic blocking synchronization, the sys-
+tem issues an asynchronous all-gather collective for each bucket. As the forward pass computes
+5https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/optimizer/layer_wise_optimizer.py
+18
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+activations using the current bucket’s weights, the GPUs simultaneously execute the all-gather
+to fetch the updated parameter matrices for the upcoming bucket from their respective owners,
+effectively hiding the network latency behind the computation. Keeping parameter matrices
+intact results in slightly uneven total parameter counts across GPUs, so standard uniform
+all-gather collectives cannot be used. Instead, the asynchronous synchronization employs a
+variable-sized allgather-V6 collective. This allows each GPU to synchronize its uniquely sized,
+contiguous buffer of updated layers to the rest of the ranks natively, avoiding the need for
+memory-wasting padding or tensor fragmentation.
+7. Conclusions and Future Work
+In this report, we conducted large-scale pretraining studies of the Muon and SOAP optimizers,
+identifying key best practices for maintaining stability at large batch sizes. We have open-sourced our
+implementations in Megatron-LM andEmerging-Optimizers. Our findings demonstrate that both
+SOAP and Muon consistently outperform AdamW, scaling effectively to significantly larger batch
+sizes during pretraining. Furthermore, the KL-SOAP variant emerged as the most effective approach
+overall; therefore, in scenarios where memory footprint is not a limiting factor, we recommend
+KL-SOAP over Muon.
+We summarize several algorithmic, system-level, and empirical directions for advancing and scaling
+these research directions below.
+SOAPTo fully realize the benefits of SOAP at frontier model scales, it is essential to support
+additional structural and distributed features. Specifically, extending our layer-wise distributed
+optimizer to natively support Tensor Parallelism (TP) for SOAP, handling fused tensors, for
+example by implementing QKV splitting for attention, and further optimizing the throughput of
+optimizer matrix multiplications such as the KL-Shampoo eigenbasis updates are areas of potential
+improvement.
+Optimizer-Driven Aligned Memory Buffer LayoutsCurrently, standard Distributed Data
+Parallel (DDP) implementations force parameters into rigid, 1D contiguous memory buffers. While
+our layer-wise algorithm successfully navigates this via bucketed, variable-sized collectives, the
+underlying buffer allocation remains largely optimizer-agnostic. This creates inherent friction for
+higher-order methods like SOAP and Muon, which operate strictly on 2D matrices and structured
+factorization states. A direction for future work is to refactor the DDP buffer allocation engine
+to be natively optimizer-driven. Rather than having the DDP module flatten parameters without
+considering the structure and boundaries of network weights, the system should allow the optimizer
+to pre-compute and dictate the layout of the parameter and gradient buffers. By granting the
+optimizer control, the physical communication buckets will map to the structural shape of the
+optimizer computations, reducing communication overhead. This optimization is being built in the
+Megatron-LM framework7 and will replace gradient all-reduces with reduce-scatters and further
+optimize memory management and sharding.
+Optimizer-Aware Architectural Co-DesignWe observed that applying orthogonalization
+to Mamba2’s Conv1D filters degraded accuracy and sometimes caused instability in the form of
+6https://www.mpich.org/static/docs/v3.2/www3/MPI_Allgatherv.html
+7https://github.com/NVIDIA/Megatron-LM/pull/4509
+19
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+NaNs, highlighting that matrix-based optimizers can be geometrically mismatched with certain
+architectures. Further investigation is needed to map out how architectural components such
+as Multi-head Latent Attention (MLA) [17] or low-rank adapters (LoRA) interact with full-rank
+preconditioning assumptions, potentially leading to hybrid training recipes that selectively route
+parameters to AdamW or Muon or a variant based on their tensor shapes and operator functions
+[29]. Along these lines, recent work has developed a matrix-based optimizer for native low-rank
+factored training [66].
+Large Batch Training and Scaling Laws for Batch SizeRecent empirical studies have
+established scaling laws to predict optimal batch sizes as a function of compute budget and training
+hyperparameters [67, 54, 68], with theoretical foundations linking these scaling laws to the interplay
+between gradient noise reduction and optimization step efficiency [69]. While we do not explicitly
+derive or measure scaling laws in this work, we instead approach batch size primarily as a systems-
+level constraint. Specifically, we push the global batch size as high as possible, while maintaining
+quality, with the goal of maximizing GPU utilization by minimizing data-parallel communication
+overhead, which is necessary for efficient pretraining at scale. An optimal approach would combine
+these two points of view, for example, by using scaling laws to better tune the batch size ramp-up
+and learning rate schedule and heuristics for changing the maximum batch size as token horizons
+vary.
+More Accurate Orthogonalization at Larger ScalesScaling matrix-based optimizers that
+perform orthogonalization to larger models and longer token horizons can introduce new numerical
+challenges that warrant further investigation. The typical size of matrices increases as we scale
+models up, and so does the “heavy-tail" of small singular values of these matrices’ gradients. Since
+the optimizer step always occurs in FP32 single precision, this “heavy-tail" of small singular values
+and their associated vectors is sensitive to numerical issues and can become increasingly susceptible
+to floating-point noise, often being below FP32 machine precision (2−23≈ 1.19× 10−7). For Muon’s
+Newton-Schulz iterations which occur in BF16, it is coarser (2−7 = 0.0078125) and small singular
+values often represent numerical noise rather than informative signal, creating an effective "noise floor"
+in FP32. Truncated or regularized orthogonalization approaches and corresponding hardware-friendly
+algorithms that implement them are open research directions, with notable recent work measuring
+spectral scaling laws for these quantities [70].
+20
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+References
+[1] Diederik P Kingma and Jimmy Ba. Adam: A method for stochastic optimization.arXiv
+preprint arXiv:1412.6980, 2014.
+[2] Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization.arXiv preprint
+arXiv:1711.05101, 2017.
+[3] Geoffrey Hinton, Nitish Srivastava, and Kevin Swersky. Neural networks for machine learning
+lecture 6a overview of mini-batch gradient descent.Cited on, 14(8):2, 2012.
+[4] Liu Ziyin, Zhikang T Wang, and Masahito Ueda. Laprop: Separating momentum and adaptivity
+in adam.arXiv preprint arXiv:2002.04839, 2020.
+[5] Thomas George, César Laurent, Xavier Bouthillier, Nicolas Ballas, and Pascal Vincent. Fast
+approximate natural gradient descent in a kronecker factored eigenbasis.Advances in neural
+information processing systems, 31, 2018.
+[6] James Martens and Roger Grosse. Optimizing neural networks with kronecker-factored approxi-
+mate curvature. InInternational conference on machine learning, pages 2408–2417. PMLR,
+2015.
+[7] Raghu Bollapragada, Jorge Nocedal, Dheevatsa Mudigere, Hao-Jun Shi, and Ping Tak Peter
+Tang. A progressive batching l-bfgs method for machine learning. InInternational Conference
+on Machine Learning, pages 620–629. PMLR, 2018.
+[8] Nikhil Vyas, Depen Morwani, Rosie Zhao, Mujin Kwun, Itai Shapira, David Brandfonbrener,
+Lucas Janson, and Sham Kakade. Soap: Improving and stabilizing shampoo using adam.arXiv
+preprint arXiv:2409.11321, 2024.
+[9] Runa Eschenhagen, Aaron Defazio, Tsung-Hsien Lee, Richard E Turner, and Hao-Jun Michael
+Shi. Purifying shampoo: Investigating shampoo’s heuristics by decomposing its preconditioner.
+arXiv preprint arXiv:2506.03595, 2025.
+[10] Wu Lin, Scott C Lowe, Felix Dangel, Runa Eschenhagen, Zikun Xu, and Roger B Grosse.
+Understanding and improving the shampoo optimizer via kullback-leibler minimization.arXiv
+e-prints, pages arXiv–2509, 2025.
+[11] Thomas Pethick, Wanyun Xie, Kimon Antonakopoulos, Zhenyu Zhu, Antonio Silveti-Falls, and
+Volkan Cevher. Training deep learning models with norm-constrained lmos.arXiv preprint
+arXiv:2502.07529, 2025.
+[12] Vineet Gupta, Tomer Koren, and Yoram Singer. Shampoo: Preconditioned stochastic tensor
+optimization. InInternational Conference on Machine Learning, pages 1842–1850. PMLR, 2018.
+[13] Jingyuan Liu, Jianlin Su, Xingcheng Yao, Zhejun Jiang, Guokun Lai, Yulun Du, Yidao Qin,
+Weixin Xu, Enzhe Lu, Junjie Yan, et al. Muon is scalable for llm training.arXiv preprint
+arXiv:2502.16982, 2025.
+[14] Ishaan Shah, Anthony M Polloreno, Karl Stratos, Philip Monk, Adarsh Chaluvaraju, Andrew
+Hojel, Andrew Ma, Anil Thomas, Ashish Tanwer, Darsh J Shah, et al. Practical efficiency of
+muon for pretraining.arXiv preprint arXiv:2505.02222, 2025.
+21
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+[15] Noah Amsel, David Persson, Christopher Musco, and Robert M Gower. The polar express:
+Optimal matrix sign methods and their application to the muon algorithm.arXiv preprint
+arXiv:2505.16932, 2025.
+[16] K Jordan, Y Jin, V Boza, Y Jiacheng, F Cecista, L Newhouse, and J Bernstein. Muon:
+An optimizer for hidden layers in neural networks, 2024b.URL https://kellerjordan. github.
+io/posts/muon.
+[17] Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao Wu, Chengda Lu, Chenggang Zhao,
+Chengqi Deng, Chenyu Zhang, Chong Ruan, et al. Deepseek-v3 technical report.arXiv preprint
+arXiv:2412.19437, 2024.
+[18] Xingwu Sun, Yanfeng Chen, Yiqing Huang, Ruobing Xie, Jiaqi Zhu, Kai Zhang, Shuaipeng Li,
+Zhen Yang, Jonny Han, Xiaobo Shu, et al. Hunyuan-large: An open-source moe model with 52
+billion activated parameters by tencent.arXiv preprint arXiv:2411.02265, 2024.
+[19] Priya Goyal, Piotr Dollár, Ross Girshick, Pieter Noordhuis, Lukasz Wesolowski, Aapo Kyrola,
+Andrew Tulloch, Yangqing Jia, and Kaiming He. Accurate, large minibatch sgd: Training
+imagenet in 1 hour.arXiv preprint arXiv:1706.02677, 2017.
+[20] Sadhika Malladi, Kaifeng Lyu, Abhishek Panigrahi, and Sanjeev Arora. On the sdes and scaling
+rules for adaptive gradient algorithms.Advances in Neural Information Processing Systems,
+35:7697–7711, 2022.
+[21] Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, Chien-Chin Huang, Min Xu, Less Wright,
+Hamid Shojanazeri, Myle Ott, Sam Shleifer, et al. Pytorch fsdp: experiences on scaling fully
+sharded data parallel.arXiv preprint arXiv:2304.11277, 2023.
+[22] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory optimiza-
+tions toward training trillion parameter models. InSC20: international conference for high
+performance computing, networking, storage and analysis, pages 1–16. IEEE, 2020.
+[23] Rohan Anil, Vineet Gupta, Tomer Koren, Kevin Regan, and Yoram Singer. Scalable second
+order optimization for deep learning.arXiv preprint arXiv:2002.09018, 2020.
+[24] Ionut-Vlad Modoranu, Philip Zmushko, Erik Schultheis, Mher Safaryan, and Dan Alistarh.
+Dash: Faster shampoo via batched block preconditioning and efficient inverse-root solvers.arXiv
+preprint arXiv:2602.02016, 2026.
+[25] David E Carlson, Edo Collins, Ya-Ping Hsieh, Lawrence Carin, and Volkan Cevher. Precondi-
+tioned spectral descent for deep learning.Advances in neural information processing systems,
+28, 2015.
+[26] David Carlson, Volkan Cevher, and Lawrence Carin. Stochastic spectral descent for restricted
+boltzmann machines. InArtificial intelligence and statistics, pages 111–119. PMLR, 2015.
+[27] David Carlson, Ya-Ping Hsieh, Edo Collins, Lawrence Carin, and Volkan Cevher. Stochastic
+spectral descent for discrete graphical models.IEEE Journal of Selected Topics in Signal
+Processing, 10(2):296–311, 2015.
+[28] Thomas Flynn. The duality structure gradient descent algorithm: analysis and applications to
+neural networks.arXiv preprint arXiv:1708.00523, 2017.
+[29] Jeremy Bernstein and Laker Newhouse. Modular duality in deep learning.arXiv preprint
+arXiv:2410.21265, 2024.
+22
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+[30] Jeremy Bernstein and Laker Newhouse. Old optimizer, new norm: An anthology.arXiv preprint
+arXiv:2409.20325, 2024.
+[31] Tim Large, Yang Liu, Minyoung Huh, Hyojin Bahng, Phillip Isola, and Jeremy Bernstein.
+Scalable optimization in the modular norm.arXiv preprint arXiv:2405.14813, 2024.
+[32] Ruijie Zhang, Yequan Zhao, Ziyue Liu, Zhengyang Wang, and Zheng Zhang. Muon+: Towards
+better muon via one additional normalization step.arXiv preprint arXiv:2602.21545, 2026.
+[33] John Zhao. Towards a principled muon under𝜇p: Ensuring spectral conditions throughout
+training.arXiv preprint arXiv:2601.01306, 2026.
+[34] Chongjie Si, Debing Zhang, and Wei Shen. Adamuon: Adaptive muon optimizer.arXiv preprint
+arXiv:2507.11005, 2025.
+[35] Zichong Li, Liming Liu, Chen Liang, Weizhu Chen, and Tuo Zhao. Normuon: Making muon
+more efficient and scalable.arXiv preprint arXiv:2510.05491, 2025.
+[36] Kaiyue Wen, Xingyu Dang, Kaifeng Lyu, Tengyu Ma, and Percy Liang. Fantastic pretraining
+optimizers and where to find them ii: From weight decay to hyperball optimization, 12 2025.
+[37] Tian Xie, Haoming Luo, Haoyu Tang, Yiwen Hu, Jason Klein Liu, Qingnan Ren, Yang Wang,
+Wayne Xin Zhao, Rui Yan, Bing Su, et al. Controlled llm training on spectral sphere.arXiv
+preprint arXiv:2601.08393, 2026.
+[38] Minxin Zhang, Yuxuan Liu, and Hayden Schaeffer. Adam improves muon: Adaptive moment
+estimation with orthogonalized momentum.arXiv preprint arXiv:2602.17080, 2026.
+[39] Kaiwei Yang and Lexiao Lai. Manifold constrained steepest descent.arXiv preprint
+arXiv:2601.21487, 2026.
+[40] Zhehang Du and Weijie Su. The newton-muon optimizer.arXiv preprint arXiv:2604.01472,
+2026.
+[41] Yechen Zhang, Shuhao Xing, Junhao Huang, Kai Lv, Yunhua Zhou, Xipeng Qiu, Qipeng Guo,
+and Kai Chen. Mousse: Rectifying the geometry of muon with curvature-aware preconditioning.
+arXiv preprint arXiv:2603.09697, 2026.
+[42] Zezhou Wang, Youjie Li, Zhiqi Lin, Jiacheng Yang, Cong Xie, Guanyu Feng, Zheng Zhong,
+Ziyue Huang, Hongyu Zhu, Zhi Zhang, et al. vescale-fsdp: Flexible and high-performance fsdp
+at scale.arXiv preprint arXiv:2602.22437, 2026.
+[43] Liangyu Wang, Siqi Zhang, Junjie Wang, Yiming Dong, Bo Zheng, Zihan Qiu, Shengkun Tang,
+Di Wang, Rui Men, and Dayiheng Liu. Canzona: A unified, asynchronous, and load-balanced
+framework for distributed matrix-based optimizers.arXiv preprint arXiv:2602.06079, 2026.
+[44] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are
+few-shot learners.Advances in neural information processing systems, 33:1877–1901, 2020.
+[45] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu,
+Chang Gao, Chengen Huang, Chenxu Lv, et al. Qwen3 technical report.arXiv preprint
+arXiv:2505.09388, 2025.
+23
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+[46] Aaron Blakeman, Aarti Basant, Abhinav Khattar, Adithya Renduchintala, Akhiad Bercovich,
+Aleksander Ficek, Alexis Bjorlin, Ali Taghibakhshi, Amala Sanjay Deshmukh, Ameya Sunil
+Mahabaleshwarkar, et al. Nemotron-h: A family of accurate and efficient hybrid mamba-
+transformer models.arXiv preprint arXiv:2504.03624, 2025.
+[47] Alexander Hägele, Elie Bakouch, Atli Kosson, Loubna B Allal, Leandro Von Werra, and Martin
+Jaggi. Scaling laws and compute-optimal training beyond fixed training durations.Advances in
+Neural Information Processing Systems, 37:76232–76264, 2024.
+[48] Jianlin Su. AdamW Weight RMS.https: // kexue. fm/ archives/ 11307, Oct 2025.
+[49] Xi-Lin Li. Stochastic hessian fittings with lie groups.arXiv preprint arXiv:2402.11858, 2024.
+[50] Atli Kosson, Bettina Messmer, and Martin Jaggi. Rotational equilibrium: How weight decay
+balances learning across neural networks.arXiv preprint arXiv:2305.17212, 2023.
+[51] Ilya Sutskever, James Martens, George Dahl, and Geoffrey Hinton. On the importance of
+initialization and momentum in deep learning. InInternational conference on machine learning,
+pages 1139–1147. pmlr, 2013.
+[52] Timothy Dozat. Incorporating nesterov momentum into adam. 2016.
+[53] Sam McCandlish, Jared Kaplan, Dario Amodei, and OpenAI Dota Team. An empirical model
+of large-batch training.arXiv preprint arXiv:1812.06162, 2018.
+[54] Aonian Li, Bangwei Gong, Bo Yang, Boji Shan, Chang Liu, Cheng Zhu, Chunhao Zhang,
+Congchao Guo, Da Chen, Dong Li, et al. Minimax-01: Scaling foundation models with lightning
+attention.arXiv preprint arXiv:2501.08313, 2025.
+[55] Yang You, Jing Li, Sashank Reddi, Jonathan Hseu, Sanjiv Kumar, Srinadh Bhojanapalli,
+Xiaodan Song, James Demmel, Kurt Keutzer, and Cho-Jui Hsieh. Large batch optimization
+for deep learning: Training bert in 76 minutes. InInternational Conference on Learning
+Representations, 2020.
+[56] Elad Hoffer, Itay Hubara, and Daniel Soudry. Train longer, generalize better: closing the
+generalization gap in large batch training of neural networks. InProceedings of the 31st
+International Conference on Neural Information Processing Systems, NIPS’17, Red Hook, NY,
+USA, 2017.
+[57] Yang You, Igor Gitman, and Boris Ginsburg. Large batch training of convolutional networks.
+arXiv preprint arXiv:1708.03888, 2017.
+[58] Alex Krizhevsky. One weird trick for parallelizing convolutional neural networks.arXiv preprint
+arXiv:1404.5997, 2014.
+[59] Fabian Gloeckle, Badr Youbi Idrissi, Baptiste Rozière, David Lopez-Paz, and Gabriel Synnaeve.
+Better & faster large language models via multi-token prediction. InProceedings of the 41st
+International Conference on Machine Learning, ICML’24, 2024.
+[60] Tri Dao and Albert Gu. Transformers are ssms: Generalized models and efficient algorithms
+through structured state space duality.arXiv preprint arXiv:2405.21060, 2024.
+[61] Katie Everett, Lechao Xiao, Mitchell Wortsman, Alexander A Alemi, Roman Novak, Peter J
+Liu, Izzeddin Gur, Jascha Sohl-Dickstein, Leslie Pack Kaelbling, Jaehoon Lee, et al. Scaling
+exponents across parameterizations and optimizers.arXiv preprint arXiv:2407.05872, 2024.
+24
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+[62] Mitchell Wortsman, Peter J Liu, Lechao Xiao, Katie Everett, Alex Alemi, Ben Adlam, John D
+Co-Reyes, Izzeddin Gur, Abhishek Kumar, Roman Novak, et al. Small-scale proxies for
+large-scale transformer training instabilities.arXiv preprint arXiv:2309.14322, 2023.
+[63] Greg Yang and Etai Littwin. Tensor programs ivb: Adaptive optimization in the infinite-width
+limit.arXiv preprint arXiv:2308.01814, 2023.
+[64] Zachary Nado.𝜖, a nuisance no more.https://zna.do/epsilon.
+[65] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan
+Catanzaro. Megatron-lm: Training multi-billion parameter language models using model
+parallelism.arXiv preprint arXiv:1909.08053, 2019.
+[66] Paul Janson, Edouard Oyallon, and Eugene Belilovsky. Stabilizing native low-rank llm pretrain-
+ing.arXiv preprint arXiv:2602.12429, 2026.
+[67] Xiao Bi, Deli Chen, Guanting Chen, Shanhuang Chen, Damai Dai, Chengqi Deng, Honghui
+Ding, Kai Dong, Qiushi Du, Zhe Fu, et al. Deepseek llm: Scaling open-source language models
+with longtermism.arXiv preprint arXiv:2401.02954, 2024.
+[68] Houyi Li, Wenzhen Zheng, Qiufeng Wang, Hanshan Zhang, Zili Wang, Shijie Xuyang, Yuantao
+Fan, Zhenyu Ding, Haoying Wang, Ning Ding, et al. Predictable scale: Part i, step law–
+optimal hyperparameter scaling law in large language model pretraining.arXiv preprint
+arXiv:2503.04715, 2025.
+[69] Rustem Islamov, Roman Machacek, Aurelien Lucchi, Antonio Silveti-Falls, Eduard Gorbunov,
+and Volkan Cevher. On the role of batch size in stochastic conditional gradient methods.arXiv
+preprint arXiv:2603.21191, 2026.
+[70] Gagik Magakyan, Pablo Parrilo, and Asuman Ozdaglar. Spectral scaling laws of muon.arXiv
+preprint arXiv:2606.04058, 2026.
+[71] Lukas Balles and Philipp Hennig. Dissecting adam: The sign, magnitude and variance of
+stochastic gradients. InInternational Conference on Machine Learning, pages 404–413. PMLR,
+2018.
+[72] Depen Morwani, Itai Shapira, Nikhil Vyas, Eran Malach, Sham Kakade, and Lucas Janson. A
+new perspective on shampoo’s preconditioner.arXiv preprint arXiv:2406.17748, 2024.
+[73] Asit Mishra, Dusan Stosic, Simon Layton, and Paulius Micikevicius. Recipes for pre-training
+llms with mxfp8.arXiv preprint arXiv:2506.08027, 2025.
+[74] Xiangning Chen, Chen Liang, Da Huang, Esteban Real, Kaiyuan Wang, Hieu Pham, Xuanyi
+Dong, Thang Luong, Cho-Jui Hsieh, Yifeng Lu, et al. Symbolic discovery of optimization
+algorithms.Advances in neural information processing systems, 36:49205–49233, 2023.
+25
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+A. Appendix
+A.1. An SVD perspective on SOAP’s preconditioner: Relating Muon, SOAP, and
+Shampoo
+As has been studied before, singular value decomposition can give us insight into how Shampoo,
+SOAP, and Muon are related to each other [14].
+Let us examine the SVD of the averaged weight gradient:8
+G𝑡 =U·Σ·V 𝑇.(5)
+Now notice (with EMAs turned off for simplicity):
+•Q 𝐿 is the eigenvector matrix ofG𝑡 G𝑇
+𝑡 , which isU, since
+G𝑡 G𝑇
+𝑡 =U Σ 2 U𝑇.(6)
+•Q 𝑅 is the eigenvector matrix ofG𝑇
+𝑡 G𝑡, which isV, since
+G𝑇
+𝑡 G𝑡 =V Σ 2 V𝑇.(7)
+We have
+G𝑅
+𝑡 =Q 𝑇
+𝐿 G𝑡 Q𝑅 =
+(︁
+U𝑇 U
+)︁
+⏟  ⏞  
+=I in×in
+Σ
+(︁
+V𝑇 V
+)︁
+⏟  ⏞  
+=I out×out
+=Σ
+Thus the gradient rotated to the eigenbasis of Shampoo’s preconditioner effectively diagonalizes it.
+Now applying Adam toG𝑅
+𝑡 :
+N= Adam(G′
+𝑡) = Adam(Σ).
+The weight update is then given by:
+ΔW=−𝜂Q 𝐿 N Q𝑇
+𝑅 =−𝜂U N V𝑇 =−𝜂U·Adam(Σ)·V 𝑇.
+Considering the limit where Adam can be approximated by thesign function [71] and when EMA is
+turnedoff, theeigenvectormatricesperfectlydiagonalizethegradient, sign(Σ) = Idmin(in,out)×min(in,out),
+the update is given by the polar factor:
+ΔW=−𝜂U·Adam(Σ)·V 𝑇≈−𝜂U·sign(Σ)·V 𝑇 =−𝜂U V 𝑇 (8)
+Similarly, consider Shampoo with exponent𝑝=−1/4[12]:
+ΔW=−𝜂(GG T)
+−1/4
+G(G TG)
+−1/4
+.
+Taking the− 1
+4 power of each term from Eq. 6 and Eq. 7, we obtain
+(GGT)
+−1/4
+=
+(︀
+U Σ2 U𝑇)︀−1/4 =U Σ−1/2 U𝑇,
+(GTG)
+−1/4
+=
+(︀
+V Σ2 V𝑇)︀−1/4 =V Σ−1/2 V𝑇.
+8An ill-conditioned gradient will have singular values with a largemax/minratio:max(Σ)
+min(Σ) >>1
+26
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Thus, substituting into the update expression for Shampoo,
+(GGT)
+−1/4
+G(G TG)
+−1/4
+=
+(︁
+U Σ−1/2 U𝑇
+)︁(︁
+U Σ V𝑇
+)︁(︁
+V Σ−1/2 V𝑇
+)︁
+=U Σ−1/2 U𝑇U⏟  ⏞  
+Iin×in
+Σ V 𝑇V⏟ ⏞ 
+Iout×out
+Σ−1/2 V𝑇
+=U(Σ −1/2 Σ Σ−1/2 )V𝑇
+=U(Id)V 𝑇
+=U V𝑇.
+Hence, Shampoo’s preconditioner is whitening the gradient, which matches what SOAP and Muon
+are doing in the simplified SVD view without momentum, eq. 8:
+ΔW=−𝜂(GG T)
+−1/4
+G(G TG)
+−1/4
+=−𝜂U V𝑇.
+A.2. An SVD Perspective on Shampoo’s Hessian: Whitening Curvature
+For a weight parameter𝑊∈ℛ in×out, the optimal Kronecker approximation to the Gauss-Newton
+Hessian [72] was shown to be related to Shampoo’s preconditioner:
+𝐻=
+E
+[︁
+𝐺𝐺⊤
+]︁
+⊗E
+[︁
+𝐺⊤𝐺
+]︁
+Tr (E[𝐺𝐺⊤])
+Substituting the spectral decompositions of the covariance matrices from Eqs. 6 and 7 into the
+Kronecker approximation (assuming the expectations are approximated by the current statistics),
+we obtain:
+H∝(UΣ 2U𝑇 )⊗(VΣ 2V𝑇 ).(9)
+Using the mixed-product property of the Kronecker product,(A⊗ B)(C⊗ D) = (AC)⊗ (BD), we
+can factorize the expression into an eigendecomposition of the Hessian:
+H∝(U⊗V)⏟  ⏞  
+Eigenvectors
+·(Σ 2⊗Σ 2)⏟  ⏞  
+Eigenvalues
+·(U⊤⊗V⊤)⏟  ⏞  
+Basis Change
+.(10)
+This reveals the spectral structure of the implicit Hessian used by Shampoo and SOAP:
+•Theeigenvectorsof Shampoo’s approximate Hessian are the Kronecker products of the left
+and right singular vectors of the gradient,u𝑖⊗v𝑗.
+•Theeigenvalues(curvature) are the products of the squared singular values,𝜆𝑖𝑗∝𝜎 2
+𝑖𝜎2
+𝑗.
+Consequently, the preconditioning operation (which effectively appliesH−1/4 in Shampoo orH−1/2
+in SOAP) dampens the gradient updates primarily along directions corresponding to large singular
+values (where curvature𝜎2
+𝑖𝜎2
+𝑗 is high) and amplifies them where singular values are small.
+27
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+A.3. An SVD perspective on KL-Shampoo: Improving Conditioning for Inversion and
+Decomposition
+While Shampoo and SOAP update Kronecker factors using the marginal covariance statisticsGG𝑇
+andG 𝑇G, KL-Shampoo [10] introduces a coupled update rule where each factor is updated using
+the inverse of the other. Here we analyze the spectral properties of this update using the singular
+value decomposition (SVD) of the gradient.
+Let the SVD of the gradient at step𝑡 beG 𝑡 =UΣV 𝑇. We assume the Kronecker factorsS𝑎 andS 𝑏
+are approximately aligned with the gradient’s eigenbasis, such that:
+S𝑎≈UΛ 𝑎U𝑇
+S𝑏≈VΛ 𝑏V𝑇
+whereΛ 𝑎 andΛ 𝑏 represent the eigenvalues captured by the Kronecker factors.
+Recall the KL-Shampoo update rule forS𝑎:
+S𝑎←(1−𝛽)S 𝑎 +𝛽
+(︁
+GS−1
+𝑏 G𝑇
+)︁
+.(11)
+Substituting the spectral forms into the update term:
+GS−1
+𝑏 G𝑇 = (UΣV𝑇 )(VΛ−1
+𝑏 V𝑇 )(VΣU𝑇 )
+=UΣ(V 𝑇V)Λ−1
+𝑏 (V𝑇V)ΣU𝑇
+=U(ΣΛ−1
+𝑏 Σ)U𝑇
+=U(Σ 2Λ−1
+𝑏 )U𝑇.
+At a fixed point where the preconditioning statistics stabilize (S𝑛𝑒𝑤≈ S𝑜𝑙𝑑), the eigenvalues of the
+updated factor must match the eigenvalues of the update term. Thus, for the diagonal entries:
+Λ𝑎≈Σ 2Λ−1
+𝑏 .(12)
+By symmetry, the update forS𝑏 yieldsΛ 𝑏≈ Σ2Λ−1
+𝑎 . Solving this system for the case where the
+spectra are balanced (Λ𝑎≈Λ 𝑏 =Λ):
+Λ≈Σ 2Λ−1
+Λ2≈Σ 2
+Λ≈Σ.
+This result highlights the fundamental difference between standard Shampoo and KL-Shampoo:
+•Shampoo:Kronecker factors track the covariance, soΛ Shampoo≈Σ 2.
+•KL-Shampoo:Kronecker factors track the singular values, soΛ KL-Shampoo≈Σ.
+This has an important advantage for numerical stability. The condition number of the matrices
+being inverted (or decomposed) in KL-Shampoo is the square root of that in standard Shampoo:
+𝜅(SKL-Shampoo) = 𝜎max
+𝜎min
+=
+√︁
+𝜅(SShampoo).(13)
+For ill-conditioned gradients where𝜅(G)is large, KL-Shampoo operates on significantly better-
+conditioned matrices, reducing the accumulation of numerical errors during the eigen-decomposition
+steps.
+28
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Metric NanoV3-1T 8B Hybrid LatentMoE-1T
+BF16 MXFP8 BF16 MXFP8 MXFP8 (Lion)
+MMLU
+MMLU69.3367.84 74.89 75.776.00
+MMLU PRO CoT51.2050.37 59.6 61.662.2
+Coding
+HumanEval 57.6859.12 65.7964.8 65.5
+HumanEval+ 52.3855.61 61.8661.2 61.5
+MBPP 63.7264.1270.99 71.372.4
+MBPP+ 52.4156.2655.26 58.7760.6
+Coding Avg. 56.55 58.78 63.48 64.02 65.00
+Math
+Math 50069.4567.25 75.6 77.178.75
+GSM8k CoT85.8285.37 85.9789.286.5
+Math Avg. 77.64 76.31 80.79 83.15 82.63
+Commonsense Reasoning
+Race 82.49 82.49 86.32 87.188.6
+ARC Challenge 83.1084.6489.16 89.492.00
+Winogrande 70.0971.35 75.3775.1 74.8
+Hellaswag79.3679.34 82.37 82.583.2
+Commonsense Avg. 78.76 79.46 83.31 83.53 84.65
+Table 7| Benchmark results across MMLU, Coding, Math, and Commonsense Reasoning compar-
+ing BF16 and MXFP8 precision formats for the NVIDIA-Nemotron-NanoV3-1T and 8B Hybrid
+LatentMoE-1T models. All experiments were performed at2×GBS of 25M tokens with Muon as the
+backbone optimizer.
+B. MXFP8 Pretraining
+We use the MXFP8 recipe developed by NVIDIA for Blackwell [73] together with Muon and pretrain
+NVIDIA-Nemotron-NanoV3 and the 8B Hybrid Mamba-Attention LatentMoE for 1T tokens. We find
+that MXFP8 has a small loss gap, while most downstream evaluations are higher with MXFP8 than
+BF16, Table 7. Further, we find that replacing AdamW with Lion [74] with(𝛽1,𝛽 2) = (0.95, 0.98)
+improves losses and evaluations (Table 7, last column).
+C. AdamW at Larger Batch Sizes
+We find that the techniques that enabled larger batch pretraining with Muon did not help with
+AdamW, Fig. 10. We leave tuning the hyperparameters𝛽1,𝛽 2,𝜖 of AdamW with batch size as future
+work.
+D. Optimizing Conv1d Filters with Muon
+For hybrid architectures incorporating Mamba2 SSM layers, we found that excludingConv1Dc
+parameters from Muon and optimizing them with AdamW instead yielded a modest but consistent
+improvement in training and validation loss, as shown in Fig. 12. The Conv1D weights in Mamba2
+29
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Figure 9| Training loss of a Qwen-3-30B-A3B architecture comparing Muon’s Newton-Schulz with
+and without splitting the fused QKV tensor. With split-QKV, the model has lower training loss
+early in pretraining, but this difference disappears as we scale token counts.
+Figure 10| NVIDIA-Nemotron-NanoV3 pretrained with AdamW for a 1T-token horizon at 25M and
+50M batch sizes. Batch size ramp-up and square-root scaling were applied to the 50M batch size run.
+30
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Figure 11| Training loss of Nano-V3 comparing Muon’s quintic-coefficient optimized Newton-Schulz
+recipe and the Polar Express recipe run for 16 iterations.
+encode localized temporal filters that are shared and re-applied at every sequence position, making
+orthogonality constraints geometrically ill-motivated compared to standard linear projections.
+D.1. Splitting fused QKV tensors before orthogonalization
+Fig. 9 shows Muon with and without splitting QKV tensors before orthogonalization. While splitting
+achieves lower losses early in training, the losses at the end of the full 1T-token horizon are identical.
+E. SOAP Eigenbasis Update Frequency
+Fig. 13 is a comparison ofeigh vs. QR decomposition to recompute the eigenbasis in SOAP. We
+found it necessary to perform QR decomposition at every step to reduce the loss spikes. This is
+likely due to the rapidly changing nature of the preconditioner basis early in training, which slower
+update schedules failed to capture. With this frequency, there was negligible difference between the
+use ofQRoreigh.
+31
+SOAP, Muon, and Beyond: Pushing LLM Pretraining Scales
+Figure 12| Training loss of Nano-V3 comparing the application of Muon vs. AdamW on the Mamba
+mixer Conv1D. Using AdamW on the Conv1D layer leads to slightly lower (≈0.1%) loss.
+Figure 13| Using eigh vs. QR decomposition to recompute SOAP’s eigenbasis has a negligible impact
+on large-scale pretraining loss on a Qwen-3-30B-A3B architecture; hence, we default to usingQR
+since it is cheaper.
+32
