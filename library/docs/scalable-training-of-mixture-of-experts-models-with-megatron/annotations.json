@@ -1,1 +1,27 @@
-[]
+[
+  {
+    "id": 1,
+    "page": 14,
+    "view": "pdf",
+    "start": 416,
+    "end": 527,
+    "quote": "MoE training is fundamentally communication-bound unless parallelism is designedspecifically for this asymmetry",
+    "comment": "",
+    "created_at": 1794870191.9724796,
+    "updated_at": 1794870191.9724796,
+    "color": "yellow"
+  },
+  {
+    "id": 2,
+    "page": 14,
+    "view": "pdf",
+    "start": 1791,
+    "end": 1897,
+    "quote": "CP is essential for long-context trainingwhere activation memory scales quadratically with sequence length",
+    "comment": "activatino scales quadratically w seq len",
+    "created_at": 1794870335.1853926,
+    "updated_at": 1794870342.4951158,
+    "color": "yellow",
+    "resolved": true
+  }
+]
